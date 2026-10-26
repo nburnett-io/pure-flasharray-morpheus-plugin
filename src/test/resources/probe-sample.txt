@@ -1,0 +1,112 @@
+@@os
+VERSION_ID=24.04
+KERNEL=6.8.0-85-generic
+HOSTNAME=hvm01
+@@pkgs
+open-iscsi|2.1.9-3ubuntu5.4|ii
+multipath-tools|0.9.4-5ubuntu8|ii
+sg3-utils|1.46-3ubuntu4|ii
+gfs2-utils|3.5.1-2|ii
+@@services
+iscsid|active|enabled
+open-iscsi|active|enabled
+multipathd|active|enabled
+@@iqn
+iqn.2024-12.com.hpe:hvm01:4f2a
+@@ifaces
+default tcp,<empty>,<empty>,<empty>,<empty>
+iser iser,<empty>,<empty>,<empty>,<empty>
+ens2f0.60 tcp,<empty>,<empty>,ens2f0.60,<empty>
+@@sessions
+Target: iqn.2010-06.com.purestorage:flasharray.1a2b3c4d5e6f (non-flash)
+	Current Portal: 192.0.2.10:3260,1
+		Iface Name: ens2f0.60
+		Iface Netdev: ens2f0.60
+		iSCSI Session State: LOGGED_IN
+	Current Portal: 198.51.100.10:3260,1
+		Iface Name: default
+		Iface Netdev: <empty>
+		iSCSI Session State: LOGGED_IN
+@@nodes
+# BEGIN RECORD 2.1.9
+node.name = iqn.2010-06.com.purestorage:flasharray.1a2b3c4d5e6f
+node.startup = automatic
+node.conn[0].address = 192.0.2.10
+node.conn[0].timeo.noop_out_interval = 5
+node.conn[0].timeo.noop_out_timeout = 5
+# END RECORD
+# BEGIN RECORD 2.1.9
+node.name = iqn.2010-06.com.purestorage:flasharray.1a2b3c4d5e6f
+node.startup = manual
+node.conn[0].address = 198.51.100.10
+node.conn[0].timeo.noop_out_interval = 5
+node.conn[0].timeo.noop_out_timeout = 5
+# END RECORD
+@@mpconf
+defaults {
+	verbosity 2
+	polling_interval 5
+	user_friendly_names "yes"
+	find_multipaths "strict"
+}
+	device {
+		vendor "PURE"
+		product "FlashArray"
+		path_grouping_policy "group_by_prio"
+		path_selector "service-time 0"
+		path_checker "tur"
+		hardware_handler "1 alua"
+		prio "alua"
+		failback "immediate"
+		fast_io_fail_tmo 10
+		max_sectors_kb 4096
+	}
+@@maps
+3624a93701a2b3c4d5e6f000000011234|3624a93701a2b3c4d5e6f000000011234|off|2
+3624a93701a2b3c4d5e6f000000015678|mpatha|off|2
+@@paths
+3624a93701a2b3c4d5e6f000000011234|sdb|active|ready|50|PURE,FlashArray,8888
+3624a93701a2b3c4d5e6f000000011234|sdc|active|ready|50|PURE,FlashArray,8888
+3624a93701a2b3c4d5e6f000000015678|sdd|active|ready|50|PURE,FlashArray,8888
+3624a93701a2b3c4d5e6f000000015678|sde|failed|faulty|0|PURE,FlashArray,8888
+@@sysfs
+sdb|mq-deadline|0|2|4096|60
+sdc|none|0|2|4096|60
+dm-3|none|0|2|4096|-
+@@routes
+192.0.2.10|ens2f0.60
+192.0.2.11|ens2f0.60
+198.51.100.10|ens2f1.62
+198.51.100.11|ens2f1.62
+@@links
+lo|65536
+ens2f0|9000
+ens2f0.60|9000
+ens2f1|9000
+ens2f1.62|1500
+@@addrs
+ens2f0.60|192.0.2.21/24
+ens2f1.62|198.51.100.21/24
+@@ping
+192.0.2.10|ok
+192.0.2.11|ok
+198.51.100.10|fail
+198.51.100.11|fail
+@@sysctl
+all|arp_ignore|0
+all|arp_announce|0
+all|rp_filter|2
+@@netplan
+ens2f0.60|/etc/netplan/99-hvmcli-virtswitch-vs0.yaml
+ens2f1.62|/etc/netplan/99-hvmcli-virtswitch-vs0.yaml
+@@gfs2mounts
+/dev/mapper/3624a93701a2b3c4d5e6f000000011234 /mnt/dddddddd-4444-4555-8666-777777777777 rw,noatime,discard
+@@gfs2withdraw
+hvmclu:ds01|0
+@@gfs2tables
+/dev/mapper/3624a93701a2b3c4d5e6f000000011234|hvmclu:ds01
+/dev/mapper/3624a93701a2b3c4d5e6f000000015678|hvmclu:ds01
+@@files
+@@hvmcli
+/usr/bin/hvmcli
+@@end
