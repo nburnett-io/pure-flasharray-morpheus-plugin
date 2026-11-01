@@ -10,7 +10,8 @@
 **`no_path_retry` on GFS2 clusters.** Failing I/O about 20 s into an all-paths outage withdraws GFS2 on that host, and
 the host is reset about two minutes later. Seen on a nested HVM 2.0 test host (Ubuntu 26.04, one iSCSI path dropped
 for 40 s): at `fail`, `session recovery timed out` at 15 s, then `Error -5 writing to journal` and `file system
-withdrawn` at once, and a reset two minutes after that; at `12` the same drop was held and I/O resumed with no error.
+withdrawn` at once, and a reboot by the Morpheus agent (`reboot -f`) two minutes after that; at `12` the same drop was
+held and I/O resumed with no error.
 The other hosts did not stall at the withdraw. This was a path drop, not a controller failover, and Pure and HPE have
 been asked what GFS2 should use.
 

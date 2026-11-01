@@ -7,9 +7,14 @@ Roughly in priority order.
      setting follows their answer.
    - Test on a test array with a real controller failover and a timing host: the longest all-paths window. Done so far
      on a nested host with a 40 s drop of its one path: `fail` withdraws GFS2 at the first failed journal write (15 s in)
-     and the host is reset about 2 minutes later; `12` holds and resumes. Still open: a finite value whose retries run
-     out, what resets the host (its journal just stops; no shutdown, no watchdog device), and the other hosts while the
-     reset host rejoins (corosync on a survivor logged a token timeout and a 72 s consensus wait).
+     and the Morpheus agent reboots the host 1 min 46 s later (`wall 'HVM Cluster Quorum Recovered - Rebooting Host in
+     5 seconds.'`, then `reboot -f` with a sysrq-b backstop); `12` holds and resumes. Still open: a finite value whose
+     retries run out, and the other hosts while the rebooted host rejoins (corosync on a survivor logged a token timeout
+     and a 72 s consensus wait; dlm_controld "daemon joined 3 needs fencing" cleared in 7 s).
+   - The withdrawn node's GFS2 journal is not replayed by the survivors (the node leaves the lockspace cleanly); it is
+     replayed only when that node remounts. Observed gap: about 3.5 minutes. A host that never comes back leaves it
+     unreplayed. That is a cluster-level matter for the HVM Cluster Health plugin, noted here because `fail` is what
+     triggers it.
    - Done on a 26.04 test host (multipath-tools 0.14.3): after `hvmcli storage multipath apply`, twice, once with a
      PURE entry in the staged file, `/etc/multipath/conf.d/pure.conf` was untouched and `multipath -t` still showed its
      values. Not repeated on 24.04 (0.9.4), where the directory is compiled in too.

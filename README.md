@@ -183,9 +183,10 @@ Pure's written value is `no_path_retry 0`. With it, I/O fails about 20 s after a
 an I/O error on the next journal write, a filesystem withdraw, and a host reset about two minutes later. **Seen on a
 nested HVM 2.0 test host** (Ubuntu 26.04, one iSCSI path, dropped for 40 s): at `fail`, `session recovery timed out`
 15 s after the drop (`fast_io_fail_tmo` was 5 there), then `Error -5 writing to journal` and `file system withdrawn`
-at once, and the host's journal stops two minutes after that; it came back with the datastore remounted. The other
-hosts' DLM recovered the member in 147 ms and their writes never stalled. The same drop at `12` held I/O and resumed
-with no error. This was a path drop, not a controller failover: neither Pure nor HPE publishes a takeover pause for
+at once, and the Morpheus agent rebooted the host (`reboot -f` after a `wall` warning) 1 min 46 s after the withdraw;
+it came back with the datastore remounted. The other hosts' DLM recovered the member in 147 ms and their writes never
+stalled, but none of them replayed the withdrawn node's journal: that happened only when the node remounted, about
+3.5 minutes after the withdraw. The same drop at `12` held I/O and resumed with no error. This was a path drop, not a controller failover: neither Pure nor HPE publishes a takeover pause for
 Purity 6.x over iSCSI, so nobody can show an all-paths window stays under 20 s, and neither has said what GFS2 should
 use. The question is open with both.
 
