@@ -1,0 +1,49 @@
+<style nonce="{{nonce}}">
+  .pure-hvm section { margin: 0 0 22px; }
+  .pure-hvm h3 { margin: 0 0 8px; font-size: 15px; }
+  .pure-hvm table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .pure-hvm th, .pure-hvm td { text-align: left; padding: 4px 6px; border-bottom: 1px solid rgba(128,128,128,.25); vertical-align: top; }
+  .pure-hvm .st-PASS { color: #2e7d32; } .pure-hvm .st-FAIL { color: #c62828; font-weight: 600; }
+  .pure-hvm .st-WARN { color: #b26a00; } .pure-hvm .st-NA { opacity: .55; }
+  .pure-hvm .muted { opacity: .7; } .pure-hvm .err { color: #c62828; }
+  .pure-hvm .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  .pure-hvm .actions { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
+  .pure-hvm .actions .btn, .pure-hvm .row .btn { margin: 0; }
+  .pure-hvm input, .pure-hvm select { padding: 3px 6px; }
+  .pure-hvm select { width: auto; max-width: 320px; display: inline-block; }
+  .pure-hvm pre { white-space: pre-wrap; font-size: 11px; max-height: 260px; overflow: auto; margin: 6px 0; }
+  .pure-hvm .ph-hidden { display: none; }
+  .pure-hvm .hint { margin-top: 4px; font-size: 11px; color: #b26a00; white-space: normal; }
+  .pure-hvm [data-field="ds-size"] { width: 110px; }
+  .pure-hvm.ph-no-admin .ph-admin { display: none; }
+</style>
+<div class="pure-hvm" data-cluster-id="{{id}}"
+     data-plugin-react-root data-plugin-key="pureFlashArrayHvm" data-plugin-entry="clusterTab">
+  <section data-section="array"><h3>FlashArrays</h3><div class="ph-body muted">Loading… (if this never changes, the tab script was blocked: check the browser console)</div></section>
+  <section data-section="hostgroup"><h3>Hosts</h3>
+    <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="plan">Refresh hosts</button>
+      <span class="muted">Each cluster host vs this cluster's host group on every linked array (matched by IQN) and its view of the Pure GFS2 datastores.</span></div>
+    <div class="ph-body"></div></section>
+  <section data-section="compliance"><h3>Host iSCSI / multipath compliance</h3>
+    <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="compliance">Run check</button>
+      <span class="muted">Read-only. Effective state (multipath -t, iscsiadm records, sysfs) against Pure and HVM requirements.</span></div>
+    <div class="row" data-field="auto-compliance"></div>
+    <div class="ph-body"></div></section>
+  <section data-section="datastores"><h3>GFS2 datastores</h3>
+    <div class="row ph-admin"><select data-field="ds-array" class="ph-hidden"></select> <input data-field="ds-name" placeholder="Datastore name"> <input data-field="ds-size" type="number" min="1" placeholder="Size GiB">
+      <button type="button" class="btn btn-primary btn-sm" data-act="create">Create GFS2 datastore</button>
+      <span class="muted">Creates the LUN, maps it to the host group, verifies every host, then Morpheus formats and mounts it cluster-wide.</span></div>
+    <div class="ph-body"></div></section>
+  <section data-section="policies"><h3>Snapshot policies</h3>
+    <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="policies">Refresh</button>
+      <span class="muted">Read-only: the array's protection groups that cover each datastore, and SafeMode. Schedules and retention are set on the array.</span></div>
+    <div class="ph-body"></div></section>
+  <section data-section="recovery"><h3>Snapshot recovery</h3><div class="ph-body muted">Pick a datastore's snapshots above.</div></section>
+  <section data-section="reclaim"><h3>Reclaim space</h3>
+    <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="reclaim">Scan datastores</button>
+      <span class="muted">Restore leftovers (.pre-restore disks, file-restore copies) no VM uses, other files that are not Morpheus disks, and Morpheus disks no VM holds.</span></div>
+    <div class="ph-body"></div></section>
+  <section data-section="retire"><h3>Retire datastore</h3><div class="ph-body muted">Retire... on a datastore above moves its VMs off with Morpheus Reconfigure, deletes it in Morpheus and removes the LUN from the hosts and the array.</div></section>
+  <section data-section="jobs"><h3>Operations</h3><div class="ph-body"></div></section>
+</div>
+<script src="{{asset "/pure-cluster-tab.js"}}?v=@PLUGIN_VERSION@" nonce="{{nonce}}"></script>

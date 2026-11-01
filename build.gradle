@@ -1,0 +1,96 @@
+buildscript {
+    repositories { mavenCentral() }
+    dependencies {
+        // Compiles src/assets into the jar's assets/ with a manifest; Morpheus serves plugin assets (tab JS, logos)
+        // only from that layout, under /assets/plugin/<plugin-name>/.
+        classpath "com.bertramlabs.plugins:asset-pipeline-gradle:$assetPipelineVersion"
+    }
+}
+
+plugins {
+    id 'groovy'
+    id 'com.gradleup.shadow' version '9.4.1'
+}
+
+apply plugin: 'asset-pipeline'
+
+assets {
+    packagePlugin = false   // as in HPE's plugins: assets are packaged into the plugin jar, not a standalone bundle
+}
+
+group = 'org.purehvm'
+
+// Folders synced by a cloud-drive client lock files under build/ and break Gradle's stale-output cleanup;
+// set PLUGIN_BUILD_DIR to build somewhere else.
+if (System.getenv('PLUGIN_BUILD_DIR')) {
+    layout.buildDirectory = file(System.getenv('PLUGIN_BUILD_DIR'))
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    // Supplied by the Morpheus appliance at runtime; never bundled into the jar.
+    provided
+    implementation.extendsFrom(provided)
+    testImplementation.extendsFrom(provided)
+}
+
+dependencies {
+    provided("com.morpheusdata:morpheus-plugin-api:$morpheusApiVersion") { exclude group: 'org.codehaus.groovy' }
+    provided "org.apache.groovy:groovy-all:$groovyVersion"
+    provided("com.bertramlabs.plugins:karman-core:$karmanVersion") { exclude module: 'groovy-all' }
+
+    testImplementation "org.spockframework:spock-core:$spockVersion"
+    // MorpheusModel.get/setConfigProperty use Jackson; the appliance provides it, the plugin-api POM does not
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+
+// groovyc ignores options.release; source/targetCompatibility is what sets the class-file version.
+java {
+    sourceCompatibility = JavaVersion.toVersion(javaRelease)
+    targetCompatibility = JavaVersion.toVersion(javaRelease)
+}
+tasks.withType(JavaCompile).configureEach { options.release = javaRelease as Integer }
+
+// Morpheus serves plugin assets with Cache-Control max-age=1 year under a fixed name, so browsers keep running an old
+// tab script after an upgrade. The template references the script with ?v=<version> to give every release a new URL.
+processResources {
+    inputs.property('pluginVersion', project.version)
+    filesMatching('renderer/**/*.hbs') {
+        filter { String line -> line.replace('@PLUGIN_VERSION@', project.version.toString()) }
+    }
+}
+
+test {
+    useJUnitPlatform()
+    testLogging { events 'failed'; exceptionFormat 'full' }
+}
+
+jar {
+    manifest {
+        attributes(
+            'Plugin-Class'                  : 'org.purehvm.PureFlashArrayPlugin',
+            'Plugin-Version'                : project.version,
+            'Morpheus-Name'                 : 'Pure FlashArray for HVM',
+            'Morpheus-Organization'         : 'Pure FlashArray for HVM contributors',
+            'Morpheus-Code'                 : 'pure-flasharray-hvm',
+            'Morpheus-Description'          : 'FlashArray iSCSI host groups, LUN lifecycle, host compliance and snapshot recovery for HVM clusters',
+            'Morpheus-Logo'                 : 'assets/pure.svg',
+            'Morpheus-Logo-Dark'            : 'assets/pure-dark.svg',
+            'Morpheus-Labels'               : 'Plugin, Storage, Pure',
+            'Morpheus-Repo'                 : 'https://github.com/nburnett-io/pure-flasharray-morpheus-plugin',
+            'Morpheus-Min-Appliance-Version': minApplianceVersion
+        )
+    }
+}
+
+shadowJar {
+    // Only our own classes and resources: everything else is provided by the appliance.
+    configurations = []
+    archiveClassifier.set('all')
+}
+
+tasks.assemble.dependsOn tasks.shadowJar

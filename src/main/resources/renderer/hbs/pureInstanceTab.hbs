@@ -1,0 +1,24 @@
+<style nonce="{{nonce}}">
+  .pure-hvm-vm section { margin: 0 0 18px; }
+  .pure-hvm-vm h3 { margin: 0 0 8px; font-size: 15px; }
+  .pure-hvm-vm table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .pure-hvm-vm th, .pure-hvm-vm td { text-align: left; padding: 4px 6px; border-bottom: 1px solid rgba(128,128,128,.25); vertical-align: top; }
+  .pure-hvm-vm .muted { opacity: .7; } .pure-hvm-vm .err { color: #c62828; } .pure-hvm-vm .ok { color: #2e7d32; }
+  .pure-hvm-vm .warn { color: #b26a00; }
+  .pure-hvm-vm .actions { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
+  .pure-hvm-vm .actions .btn { margin: 0; }
+  .pure-hvm-vm pre { white-space: pre-wrap; font-size: 11px; max-height: 260px; overflow: auto; margin: 6px 0; }
+  .pure-hvm-vm label.opt { display: block; font-weight: normal; margin: 4px 0; }
+  .pure-hvm-vm .sub { margin: 2px 0 6px 22px; display: block; }
+  .pure-hvm-vm .note { margin: 8px 0; font-size: 12px; }
+  .pure-hvm-vm .ph-hidden { display: none; }
+</style>
+<div class="pure-hvm-vm" data-instance-id="{{id}}"
+     data-plugin-react-root data-plugin-key="pureFlashArrayHvm" data-plugin-entry="instanceTab">
+  <section data-section="vm"><h3>Restore to an earlier point in time</h3><div class="ph-body muted">Loading…</div></section>
+  <section data-section="copies" class="ph-hidden"><h3>Disk copies attached for file recovery</h3><div class="ph-body"></div></section>
+  <section data-section="action" class="ph-hidden"><h3>Restore</h3><div class="ph-body"></div></section>
+  <section data-section="points"><h3>Restore points</h3><div class="ph-body"></div></section>
+  <section data-section="progress"><h3>Progress</h3><div class="ph-body muted">Nothing running.</div></section>
+</div>
+<script src="{{asset "/pure-instance-tab.js"}}?v=@PLUGIN_VERSION@" nonce="{{nonce}}"></script>
