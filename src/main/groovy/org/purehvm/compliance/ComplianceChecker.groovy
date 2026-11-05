@@ -107,8 +107,12 @@ class ComplianceChecker {
 
         Set<String> boundNetdevs = f.ifaces.findAll { it.netdev }*.netdev as Set<String>
         List<String> unbound = storIfs.findAll { !boundNetdevs.contains(it) }.sort()
+        // on HVM 2.0 Morpheus makes these ifaces with the host's iSCSI virtual switch; the plugin's sessions fix follows
+        // Morpheus there (hvmcli) and does not add ifaces of its own
         r << new Result('ISC-02', 'iSCSI iface bound to each storage NIC', Severity.HIGH, unbound ? Status.FAIL : Status.PASS,
-                unbound ? "unbound: ${unbound.join(', ')}".toString() : boundNetdevs.sort().join(', '), 'iface.net_ifacename per NIC', 'iscsi-sessions')
+                unbound ? "unbound: ${unbound.join(', ')}".toString() : boundNetdevs.sort().join(', '), 'iface.net_ifacename per NIC',
+                f.hvmcli ? null : 'iscsi-sessions',
+                unbound && f.hvmcli ? 'Morpheus creates this iface with the host\'s iSCSI virtual switch: check the switch for this NIC on the host in Morpheus (edit or re-create it there).' : null)
 
         List<Map> live = f.pureSessions.findAll { it.state == 'LOGGED_IN' }
         List<String> noSession = reachable.findAll { String p -> !live.any { it.portal == p } }
@@ -246,6 +250,9 @@ class ComplianceChecker {
         r << new Result('GFS-01', 'GFS2 mounted by WWID device path', Severity.HIGH,
                 f.gfs2Mounts ? (aliasMounts ? Status.FAIL : Status.PASS) : Status.NA,
                 aliasMounts ? aliasMounts*.source.join(', ') : "${f.gfs2Mounts.size()} mount(s)".toString(), '/dev/mapper/3<wwid>', null)
+        // only a failing or warning check offers its fix: a not-applicable one (no node records yet on a new host) sent
+        // node-startup to a host with nothing to update, and that is what stopped remediation of fresh hosts
+        r.each { Result x -> if (x.status in [Status.PASS, Status.NA]) { x.fix = null } }
         r
     }
 

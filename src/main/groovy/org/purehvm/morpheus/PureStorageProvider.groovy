@@ -55,9 +55,9 @@ class PureStorageProvider extends AbstractStorageProvider implements PluginProvi
     }
 
     /**
-     * A host joined a cluster that is linked to a FlashArray: add it to the host group and rescan (as the tab's
-     * "Add to host group" does), unless the "Add new cluster hosts automatically" setting is off. Mounting stays a
-     * deliberate action in the tab. Host removal only logs; the tab shows the leftover array host.
+     * A host joined a cluster that is linked to a FlashArray: set up its iSCSI as Morpheus does, add it to the host
+     * group and rescan (as the tab's "Add" does), unless the "Add new cluster hosts automatically" setting is off.
+     * Mounting stays a deliberate action in the tab. Host removal only logs; the tab shows the leftover array host.
      */
     @Override
     void onEvent(Event event, AccountIntegration integration) {
@@ -86,9 +86,9 @@ class PureStorageProvider extends AbstractStorageProvider implements PluginProvi
                 log.info("Pure plugin: auto-add disabled; ${host} must be added from the cluster tab")
                 return
             }
-            Audit.info(morpheus, null, ctx.cluster, 'host joined the cluster: adding it to the FlashArray host group(s)', [host: host])
+            Audit.info(morpheus, null, ctx.cluster, 'host joined the cluster: setting up its iSCSI and adding it to the FlashArray host group(s)', [host: host])
             Jobs.start('auto-add-host', clusterId, 'morpheus (host added)') { List<String> progress ->
-                [host: host, storage: new HostOnboarding(morpheus, ctx, progress).add(host)]   // every linked array
+                [host: host, storage: new HostOnboarding(morpheus, ctx, progress, settings).add(host)]   // every linked array
             }
         } catch (Exception e) {
             log.warn("Pure plugin: auto-add of ${host} to cluster ${clusterId} not started: ${e.message}")

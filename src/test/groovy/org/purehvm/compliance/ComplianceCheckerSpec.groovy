@@ -367,15 +367,24 @@ overrides|no_path_retry|queue
         !ComplianceChecker.sharedSubnet(['a', 'b'], [a: ['192.0.2.21/24'], b: ['198.51.100.21/24']])
     }
 
-    def 'remediation script binds the missing iface, logs in missing sessions and writes drop-ins'() {
+    /** The sample as an HVM 1.3 host: no hvmcli, so the plugin binds ifaces and logs in with iscsiadm itself. */
+    private HostFacts withoutHvmcli(HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)) {
+        f.hvmcli = false
+        f
+    }
+
+    def 'without hvmcli the remediation script binds the missing iface, logs in missing sessions and writes drop-ins'() {
         given:
-        def fixes = results.findAll { it.status == Status.FAIL && it.fix }*.fix.unique()
+        HostFacts f = withoutHvmcli()
+        def fixes = new ComplianceChecker().check(f, ctx).findAll { it.status == Status.FAIL && it.fix }*.fix.unique()
 
         when:
-        def s = new Remediation().scriptSteps(facts, fixes, ctx.portals, ctx.purityVersion)*.script.join('')
+        def s = new Remediation().scriptSteps(f, fixes, ctx.portals, ctx.purityVersion)*.script.join('')
 
         then:
-        s.contains('iscsiadm -m iface -I ens2f1.62 --op=new')
+        s.contains('iscsiadm -m iface -I ens2f1.62 >/dev/null 2>&1 || iscsiadm -m iface -I ens2f1.62 --op=new')
+        s.contains('iscsi_ok iscsiadm -m session --rescan')
+        !s.contains('hvmcli storage iscsi')
         s.contains('iscsiadm -m node -p 192.0.2.11:3260 -I ens2f0.60 --login')
         !s.contains('iscsiadm -m node -p 192.0.2.10:3260 -I ens2f0.60 --login')   // already logged in
         s.contains('iscsiadm -m node -p 198.51.100.10:3260 -I ens2f0.60 -o delete')  // cross-fabric record
@@ -421,7 +430,7 @@ overrides|no_path_retry|queue
 
     def 'remediation skips gatewayed portals and a discovery timeout cannot abort it'() {
         when:
-        def s = new Remediation().scriptSteps(gatewayedFacts(), ['iscsi-sessions'], ctx.portals + ['203.0.113.10'], '6.10.4')*.script.join('')
+        def s = new Remediation().scriptSteps(withoutHvmcli(gatewayedFacts()), ['iscsi-sessions'], ctx.portals + ['203.0.113.10'], '6.10.4')*.script.join('')
 
         then:
         s.contains("SKIP portal 203.0.113.10: only reachable through a gateway (mgmt via 203.0.113.254)")
@@ -502,7 +511,7 @@ array01-test|/mnt/bbbbbbbb-2222-4333-8444-555555555555|inactive
         def steps = new Remediation().scriptSteps(facts, ['udev', 'iscsi-sessions', 'node-startup'], ctx.portals, '6.10.4')
 
         then:
-        steps*.title == ['udev rules', 'iSCSI iface binding and sessions (adds only)', 'node records: startup automatic, NOP-Out 5/5']
+        steps*.title == ['udev rules', 'iSCSI sessions via Morpheus (hvmcli, adds only)', 'node records: startup automatic, NOP-Out 5/5']
         steps.every { it.script.startsWith('#!/bin/bash\nset -euo pipefail') }
         steps[0].script.contains(Remediation.UDEV_RULES) && !steps[0].script.contains('iscsiadm')
     }
@@ -516,6 +525,139 @@ array01-test|/mnt/bbbbbbbb-2222-4333-8444-555555555555|inactive
         expect:
         new ComplianceChecker().check(f, ctx).find { it.id == 'GFS-03' }.status == Status.PASS
         status('GFS-03') == Status.FAIL   // the sample without the recovery mount
+    }
+
+    /** A host Morpheus has just added: hvmcli, iSCSI NICs routed, nothing else (no sessions, no node records, no IQN). */
+    static HostFacts freshHost(boolean openIscsi = true) {
+        HostFacts.parse("""@@os
+VERSION_ID=26.04
+KERNEL=7.0.0-10-generic
+@@pkgs
+${openIscsi ? 'open-iscsi|2.1.11-1ubuntu1|ii ' : ''}
+multipath-tools|0.14.3-1|ii
+@@services
+iscsid|inactive|disabled
+multipathd|active|enabled
+@@iqn
+@@ifaces
+@@sessions
+@@nodes
+@@mpconf
+@@mpglobal
+@@maps
+@@paths
+@@sysfs
+@@routes
+192.0.2.10|hvmbr0.60|
+192.0.2.11|hvmbr0.60|
+198.51.100.10|hvmbr0.62|
+198.51.100.11|hvmbr0.62|
+@@links
+hvmbr0.60|9000
+hvmbr0.62|9000
+@@addrs
+hvmbr0.60|192.0.2.21/24
+hvmbr0.62|198.51.100.21/24
+@@hvmcli
+/usr/bin/hvmcli
+@@end
+""")
+    }
+
+    def 'a check that does not apply offers no fix: a fresh host is never sent node-startup (it stopped remediation on 0.12)'() {
+        when:
+        List<ComplianceChecker.Result> rs = new ComplianceChecker().check(freshHost(), ctx)
+        List<String> offered = rs.findAll { it.fix }*.fix.unique()
+
+        then:
+        rs.find { it.id == 'ISC-04' }.status == Status.NA
+        !offered.contains('node-startup')
+        rs.findAll { it.status in [Status.PASS, Status.NA] }.every { it.fix == null }
+        offered.containsAll(['iqn', 'services', 'iscsi-sessions', 'multipath'])
+    }
+
+    def 'node-startup and the session rescan treat iscsiadm "no records" (exit 21) as nothing to do'() {
+        when:
+        String s = new Remediation().scriptSteps(withoutHvmcli(freshHost()), ['node-startup', 'iscsi-sessions'], ctx.portals, '6.10.4')*.script.join('')
+
+        then:
+        s.contains('iscsi_ok() { local rc=0; "$@" || rc=$?; [ "$rc" -eq 0 ] || [ "$rc" -eq 21 ] || return "$rc"; }')
+        s.contains('{ iscsi_ok iscsiadm -m node 2>/dev/null; } | awk')
+        s.contains('iscsi_ok iscsiadm -m session --rescan')
+        !(s =~ /(?m)^iscsiadm -m session --rescan/)
+    }
+
+    def 'with hvmcli, sessions are made the way Morpheus makes them, only to its targets and only where missing'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)   // logged in to 192.0.2.10 and 198.51.100.10
+
+        when:
+        String s = new Remediation().scriptSteps(f, ['iscsi-sessions'], ctx.portals, '6.10.4', '0',
+                [targets: ['192.0.2.10', '192.0.2.11', '198.51.100.10']])*.script.join('')
+
+        then:
+        s.contains("hvmcli storage iscsi configure --portal '192.0.2.11:3260' --json")
+        !s.contains("--portal '192.0.2.10:3260'") && !s.contains("--portal '198.51.100.10:3260'")   // already logged in
+        s.contains("session to 198.51.100.10 already up")
+        !s.contains("--portal '198.51.100.11:3260'")                 // not a Morpheus target of the cluster
+        s.contains("SKIP portal 198.51.100.11: not a Morpheus iSCSI target")
+        !s.contains('--initiator-name')                               // the host keeps its name
+        !s.contains('iscsiadm -m iface')                              // Morpheus's virtual switch owns the ifaces
+        !s.contains('--login')
+        s.contains('WARN hvmcli configure')                           // one portal failing does not stop the others
+    }
+
+    def 'with hvmcli and no Morpheus target list, every routed portal is wanted; gatewayed ones never'() {
+        when:
+        String s = new Remediation().scriptSteps(gatewayedFacts(), ['iscsi-sessions'], ctx.portals + ['203.0.113.10'], '6.10.4')*.script.join('')
+
+        then:
+        s.contains("--portal '192.0.2.11:3260'")
+        s.contains("SKIP portal 203.0.113.10: only reachable through a gateway")
+        !s.contains("--portal '203.0.113.10:3260'")
+    }
+
+    def 'an empty initiator name gets the IQN Morpheus has on record; a new one only when Morpheus has none'() {
+        when:
+        String withRecord = new Remediation().scriptSteps(freshHost(), ['iqn'], ctx.portals, '6.10.4', '0', [iqn: 'iqn.2026-11.com.hpe:hvm-node04:4321'])[0].script
+        String noRecord = new Remediation().scriptSteps(freshHost(), ['iqn'], ctx.portals, '6.10.4', '0', [:])[0].script
+        String hostile = new Remediation().scriptSteps(freshHost(), ['iqn'], ctx.portals, '6.10.4', '0', [iqn: "iqn.2026-11.com.hpe:x'; reboot; '"])[0].script
+
+        then:
+        withRecord.contains("IQN='iqn.2026-11.com.hpe:hvm-node04:4321'; SRC='Morpheus record'")
+        withRecord.contains("grep -qE '^InitiatorName=iqn\\.'")       // still never replaces an existing name
+        !withRecord.contains('RANDOM')
+        noRecord.contains('RANDOM') && noRecord.contains("Morpheus had none")
+        !hostile.contains('reboot') && hostile.contains('RANDOM')     // an unsafe record is not put in a script
+    }
+
+    def 'host scripts find hvmcli where HVM installs it (/usr/local/bin), as the probe must to detect it'() {
+        given:
+        String path = 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+        expect:
+        getClass().getResource('/scripts/pure-host-probe.sh').text.contains(path)
+        Remediation.HEADER.contains(path)
+        HostScripts.rescanAll().contains(path)
+    }
+
+    def 'packages are retried once after refreshing the package lists'() {
+        when:
+        String s = new Remediation().scriptSteps(freshHost(false), ['packages'], ctx.portals, '6.10.4')[0].script
+
+        then:
+        s.contains('if ! apt-get install -y -q $PKGS; then')
+        s.contains('apt-get update -q && apt-get install -y -q $PKGS')
+    }
+
+    def 'on hvmcli hosts an unbound storage NIC points at the Morpheus iSCSI switch instead of offering a fix'() {
+        when:
+        def hv = new ComplianceChecker().check(facts, ctx).find { it.id == 'ISC-02' }
+        def legacy = new ComplianceChecker().check(withoutHvmcli(), ctx).find { it.id == 'ISC-02' }
+
+        then:
+        hv.status == Status.FAIL && hv.fix == null && hv.hint.contains('iSCSI virtual switch')
+        legacy.status == Status.FAIL && legacy.fix == 'iscsi-sessions'
     }
 
     def 'multipath change is refused while GFS2 is mounted through an alias'() {

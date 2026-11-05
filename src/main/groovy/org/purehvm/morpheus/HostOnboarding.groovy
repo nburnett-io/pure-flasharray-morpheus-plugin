@@ -13,6 +13,8 @@ import groovy.util.logging.Slf4j
 
 /**
  * Bringing a host that was added to an HVM cluster onto the FlashArray and the cluster's GFS2 datastores:
+ *   0. set up its iSCSI the way Morpheus does (HostConnect): packages, Morpheus's initiator name if it has none,
+ *      services, multipath/udev drop-ins, and sessions to the cluster's Morpheus iSCSI targets with hvmcli
  *   1. add it to the cluster's host group (create the array host by IQN if needed) - array side, one host only
  *   2. rescan iSCSI/multipath on it so the cluster's LUNs appear
  *   3. ask Morpheus to refresh each GFS2 datastore (Morpheus owns GFS2 mounting) and re-check
@@ -25,11 +27,29 @@ class HostOnboarding {
     final MorpheusContext morpheus
     final PureClusterContext ctx
     final List<String> progress
+    final Map settings
 
-    HostOnboarding(MorpheusContext morpheus, PureClusterContext ctx, List<String> progress = []) {
+    HostOnboarding(MorpheusContext morpheus, PureClusterContext ctx, List<String> progress = [], Map settings = [:]) {
         this.morpheus = morpheus
         this.ctx = ctx
         this.progress = progress
+        this.settings = settings ?: [:]
+    }
+
+    /**
+     * Step 0: the host's iSCSI, set up as Morpheus does. Morpheus builds the iSCSI networking and the initiator name
+     * when it adds a host; this adds the sessions straight away (Morpheus's own pass would get there minutes later)
+     * plus anything missing. Never fails the add: a host that already has an IQN can still go on the array.
+     */
+    void connect(String host, Collection<String> morpheusTargets = null) {
+        try {
+            List<String> portals = ComplianceMonitor.arrayFacts(ctx).portals as List<String>
+            Collection<String> targets = morpheusTargets != null ? morpheusTargets : HostConnect.appliedTargets(ctx, host, portals)
+            HostConnect.apply(ctx, host, null, targets, settings, progress)
+            ctx.syncIqnRecords().each { step(it) }
+        } catch (Exception e) {
+            step("WARNING ${host}: iSCSI set-up did not finish: ${e.message}")
+        }
     }
 
     private void step(String s) {
@@ -103,16 +123,17 @@ class HostOnboarding {
     }
 
     /**
-     * Steps 1-3 for one host: every linked array's host group (or only {@code onlyStorageServerId}), then one rescan
-     * and the storage check. Returns its storage state afterwards.
+     * Steps 0-3 for one host: its iSCSI, every linked array's host group (or only {@code onlyStorageServerId}), then one
+     * rescan and the storage check. Returns its storage state afterwards.
      */
-    List<Map> add(String host, Long onlyStorageServerId = null) {
+    List<Map> add(String host, Long onlyStorageServerId = null, Collection<String> morpheusTargets = null) {
         ctx.requireHost(host)
         List<Map> links = ctx.links.findAll { !onlyStorageServerId || it.storageServerId == onlyStorageServerId }
         if (!links) {
             throw new IllegalStateException("Cluster ${ctx.cluster.name} is not linked to ${onlyStorageServerId ? 'that array' : 'any FlashArray'}")
         }
-        List<HostGroupPlanner.Node> nodes = ctx.nodes
+        connect(host, morpheusTargets)
+        List<HostGroupPlanner.Node> nodes = ctx.nodes   // after step 0: the IQN it may just have been given
         List<String> failures = []
         links.each { Map l ->
             try {

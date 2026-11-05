@@ -96,6 +96,7 @@ class PureController implements PluginController {
                 Route.build('/pure-hvm/compliance', 'compliance', read),
                 Route.build('/pure-hvm/recovery-vms', 'recoveryVms', read),
                 Route.build('/pure-hvm/hosts', 'hosts', read),
+                Route.build('/pure-hvm/portal-routes', 'portalRoutes', read),
                 Route.build('/pure-hvm/array-hosts', 'arrayHosts', read),
                 Route.build('/pure-hvm/retire-plan', 'retirePlan', read),
                 Route.build('/pure-hvm/datastore-tenants', 'datastoreTenants', read),
@@ -449,21 +450,34 @@ class PureController implements PluginController {
                          HostGroupPlanner.HostStep s = plan?.hosts?.find { it.node == h }
                          [storageServerId: a.storageServerId, server: a.server, arrayHost: s?.arrayHost,
                           action: plan == null ? 'UNKNOWN' : (s?.action?.name() ?: 'UNKNOWN'),
-                          detail: plan == null ? (a.error ?: 'array unreachable') : (s?.detail ?: 'no iSCSI initiator name found')]
+                          detail: plan == null ? (a.error ?: 'array unreachable') : (s?.detail ?: 'no iSCSI initiator name yet: Add sets up its iSCSI first')]
                      },
                      storage: (st[h] ?: []).collect { it + [text: HostOnboarding.describe(it)] }]
                 }])
         }
     }
 
-    /** Adds a host to every linked array's host group, or only to storageServerId's. */
+    /**
+     * Read-only: which linked-array portals each host reaches directly, through a gateway, or not at all. The tab lays
+     * it next to the cluster's Morpheus iSCSI targets (which it reads as the user) to offer the missing ones.
+     */
+    def portalRoutes(ViewModel<Map> m) {
+        guarded {
+            PureClusterContext ctx = operatorCtx(m)
+            List<String> portals = ComplianceMonitor.arrayFacts(ctx).portals as List<String>
+            ok([hosts: ctx.hostNames, portals: HostConnect.portalReach(portals, ctx.onAllHosts(HostConnect.routeScript(portals)))])
+        }
+    }
+
+    /** Connects a host's iSCSI (as Morpheus does), then adds it to every linked array's host group, or only to storageServerId's. */
     def hostAdd(ViewModel<Map> m) {
         guarded {
             String host = p(m).host as String
             Long only = optionalLong(p(m).storageServerId)
+            List<String> targets = morpheusTargets(m)
             startJob(m, 'host-add') { PureClusterContext ctx, List<String> progress ->
                 syncIqns(ctx, progress)
-                [host: host, storage: new HostOnboarding(morpheus, ctx, progress).add(host, only)]
+                [host: host, storage: new HostOnboarding(morpheus, ctx, progress, settings()).add(host, only, targets)]
             }
         }
     }
@@ -572,35 +586,30 @@ class PureController implements PluginController {
         }
     }
 
+    /**
+     * The cluster's Morpheus iSCSI targets as the tab read them (as the user, from /api/clusters/{id}/iscsi-targets):
+     * "a,b,c", or "-" for none. Absent: unknown, and the host jobs follow what Morpheus applied on the other hosts.
+     */
+    private static List<String> morpheusTargets(ViewModel<Map> m) {
+        Object v = p(m).morpheusTargets
+        if (v == null || v == '') {
+            return null
+        }
+        List<String> l = (v instanceof List ? v : (v as String).tokenize(',')) as List<String>
+        l = l*.trim().findAll { it && it != '-' }
+        l.each { if (!(it ==~ /[0-9a-fA-F.:]+/)) { throw new IllegalArgumentException("not an iSCSI target address: ${it}") } }
+        l
+    }
+
     def remediate(ViewModel<Map> m) {
         guarded {
             String host = p(m).host as String
             List<String> fixes = (p(m).fixes instanceof List ? p(m).fixes : (p(m).fixes as String)?.tokenize(',')) as List<String>
+            List<String> targets = morpheusTargets(m)
             startJob(m, 'remediate') { PureClusterContext ctx, List<String> progress ->
                 ctx.requireHost(host)
                 progress << "${host}: reading the host's current iSCSI/multipath state".toString()
-                Map info = ComplianceMonitor.arrayFacts(ctx)
-                HostRunner r = ctx.runner
-                HostFacts f = HostFacts.parse(r.run(host, ComplianceMonitor.probe(info.portals as List<String>)).output)
-                if (!f.complete) {
-                    throw new IllegalStateException("${host}: the probe did not finish; nothing changed")
-                }
-                f.gatewayed.each { p, via -> progress << "${host}: portal ${p} is only reachable through a gateway (${via}); left alone".toString() }
-                List<Map<String, String>> steps = new Remediation().scriptSteps(f, fixes, info.portals as List<String>, info.purity as String,
-                        Remediation.noPathRetrySetting(settings().multipathNoPathRetry))
-                List<String> applied = []
-                steps.eachWithIndex { Map<String, String> s, int i ->
-                    progress << "${host}: [${i + 1}/${steps.size()}] ${s.title}...".toString()
-                    HostRunner.Result res = r.run(host, s.script)
-                    List<String> lines = (res.output ?: '').readLines().findAll { it.trim() && !it.startsWith('== ') && !it.startsWith('ERROR=') }
-                    lines.each { progress << "    ${it}".toString() }
-                    if (!res.ok) {
-                        progress << "    ${res.error ?: ''}".toString()
-                        throw new IllegalStateException("${host}: step '${s.title}' failed (exit ${res.exitCode})" +
-                                (applied ? "; already applied: ${applied.join(', ')}" : '; nothing applied before it'))
-                    }
-                    applied << s.title
-                }
+                List<String> applied = HostConnect.apply(ctx, host, fixes ?: [], targets, settings(), progress)
                 syncIqns(ctx, progress)   // a new initiator name must reach the Morpheus record too
                 progress << "${host}: done; run Check again to see the result".toString()
                 [host: host, applied: applied]

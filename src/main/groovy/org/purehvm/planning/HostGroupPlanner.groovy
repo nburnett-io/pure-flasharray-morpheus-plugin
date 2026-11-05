@@ -88,7 +88,7 @@ class HostGroupPlanner {
         Map<Node, ArrayHost> matched = [:]
         nodes.each { Node n ->
             if (!n.iqns) {
-                p.blockers << "${n.name}: no iSCSI initiator name found (is open-iscsi installed?)".toString()
+                p.blockers << "${n.name}: no iSCSI initiator name yet; use Add on its row (sets up the host's iSCSI as Morpheus does, then adds it)".toString()
                 return
             }
             Set<ArrayHost> hits = n.iqns.collect { byIqn[normalizeIqn(it)] }.findAll { it != null } as Set<ArrayHost>

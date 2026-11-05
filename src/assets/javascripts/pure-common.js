@@ -58,12 +58,14 @@
   /**
    * Morpheus's own /api as the logged-in user: session cookie plus the UI's CSRF header. Morpheus applies this user's
    * permissions; the plugin never needs a token of its own for these calls. Errors carry the HTTP status (e.status).
+   * A URLSearchParams payload goes form-encoded: some 9.1 endpoints (cluster iSCSI targets) read only form fields.
    */
   function mapi(method, path, payload) {
     var h = csrfHeaders();
     h['X-Requested-With'] = 'XMLHttpRequest'; h.Accept = 'application/json';
     var opts = { method: method, credentials: 'same-origin', headers: h, redirect: 'manual' };
-    if (payload !== undefined) { h['Content-Type'] = 'application/json'; opts.body = JSON.stringify(payload); }
+    if (payload instanceof URLSearchParams) opts.body = payload;
+    else if (payload !== undefined) { h['Content-Type'] = 'application/json'; opts.body = JSON.stringify(payload); }
     return fetch(path, opts).then(function (r) {
       expired(r, method + ' ' + path);
       return r.text().then(function (txt) {

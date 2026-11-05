@@ -24,9 +24,16 @@ Roughly in priority order.
    - The probe does not read a `multipaths {}` section, which beats `overrides` for one WWID.
    - During an all-paths window on a finite map, `blkid` in the probe blocks until the window ends, because it reads the
      device (with `queue`, for ever). Skip maps with no usable path if that proves a problem.
-1. **Cluster membership events.** Handle `ClusterEvent.ADD_WORKER` / `REMOVE_WORKER`: add the new node's IQN to the
-   host group before Morpheus auto-logs in to the iSCSI targets, and remove it on node removal. The event signature is
-   `void onEvent(E, AccountIntegration)`.
+1. **Cluster membership events.** ADD_WORKER sets up the host's iSCSI (0.13.0), adds it to the host group and rescans.
+   Still open:
+   - Prove it on a real host joining with no FlashArray sessions (the nested test hosts cannot reach the array's iSCSI
+     subnets).
+   - Morpheus builds the iSCSI virtual switch when it adds a host. If ADD_WORKER fires before that switch is up, the
+     sessions step finds no route and the host waits for Morpheus's own pass (or Add). A retry after a few minutes may
+     be needed.
+   - REMOVE_WORKER only logs; the array host stays in the host group until removed on the array.
+   - Learned while testing: one iSCSI iface record bound to a missing NIC makes `hvmcli storage iscsi configure` (and so
+     Morpheus's own target set-up) fail on that host. A compliance check for unusable iface records would catch it.
 2. **Storage server sync.** In `refreshStorageServer`, sync array hosts, host groups and volumes into
    `StorageHost` / `StorageHostGroup` / `StorageVolume` with SyncTask, so they show under Infrastructure > Storage.
 3. **Stale recovery sweeper.** Find `role=recovery-clone` volumes older than N hours (tag `created`) whose host has no

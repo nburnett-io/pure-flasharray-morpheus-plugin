@@ -120,7 +120,7 @@ non-pinned VMs shut down.
 |---|---|
 | Add array (URL and credentials) | Storage Server type with token and pinned certificate |
 | Add/Update Host Groups wizard (plan, then apply) | Host group section |
-| Configure iSCSI on hosts (SendTargets, LoginTimeout 30, NoopInterval 5) | Compliance and remediation; per-NIC iface binding is stricter than Pure's ESXi logic |
+| Configure iSCSI on hosts (SendTargets, LoginTimeout 30, NoopInterval 5) | Compliance and remediation. On HVM 2.0 the sessions follow Morpheus: the cluster's Morpheus iSCSI targets, logged in with Morpheus's own `hvmcli storage iscsi configure`, and the IQN Morpheus has on record |
 | Create datastore (volume → host group → rescan → VMFS) | Create GFS2 datastore |
 | Edit or expand datastore | Grow |
 | Snapshots tab (create, list including pgroup snapshots) | Snapshots |
@@ -140,7 +140,8 @@ Tested on: Morpheus 9.1, an HVM cluster of two hosts on Ubuntu 24.04/26.04, one 
 | FlashArray REST client, service-user bootstrap, cert pinning | yes | yes (fake transport) | yes |
 | Host-group planner and applier | yes | planner yes | reuse of an existing host group by IQN, yes; creating one, no |
 | Compliance probe and checks | yes | yes (sample probe output) | probe and checks run on both hosts, yes |
-| Remediation | yes | script content | no |
+| Remediation | yes | script content | empty-host steps on test hosts with iSCSI records hidden; Morpheus IQN write-back; `hvmcli configure` path (0.13.0) |
+| iSCSI set-up on Add host / host join, Morpheus targets section (0.13.0) | yes | yes | on hosts already set up (no-op end to end) and the targets view; a host joining with no FlashArray sessions, no |
 | `no_path_retry` checks and setting (0.12.0) | yes | every MP-03 and MP-03b state, kept finite value | mostly: probe read on 24.04 and 26.04; drop-in survives `hvmcli storage multipath apply`; path drop on a nested 2.0 host (`fail` withdraws and the host resets, `12` holds 40 s). Not a real controller failover |
 | Adopting existing datastores | yes | yes | yes |
 | Grow (array, rescan, `gfs2_grow`, Morpheus capacity) | yes | yes | yes |

@@ -3,7 +3,7 @@
 # Usage: pure-host-probe.sh <portal-ip> [<portal-ip> ...]
 # Prints "@@<section>" headers followed by raw command output; the plugin parses it.
 # CHAP secrets are never printed (node records are filtered to an allow-list of keys).
-export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PORTALS="$*"
 
 sec() { echo "@@$1"; }

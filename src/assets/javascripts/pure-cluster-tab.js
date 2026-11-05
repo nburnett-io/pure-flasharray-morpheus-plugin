@@ -51,6 +51,65 @@
         .catch(function (e) { body('jobs').prepend(lib.errBox(e)); });
     }
 
+    /**
+     * The cluster's Morpheus iSCSI targets (addresses), read as the user; null when Morpheus would not say. Host jobs
+     * follow them, so the plugin only ever connects a host to what Morpheus itself manages for the cluster.
+     */
+    function morpheusTargets() {
+      return mapi('GET', '/api/clusters/' + clusterId + '/iscsi-targets?max=200')
+        .then(function (j) { return (j.iscsiTargets || []).map(function (t) { return t.targetIp; }); }, function () { return null; });
+    }
+    function withTargets(params) {
+      return morpheusTargets().then(function (t) {
+        if (t) params.morpheusTargets = t.length ? t.join(',') : '-';
+        return params;
+      });
+    }
+    /** A host job that connects iSCSI: started with the cluster's Morpheus targets. */
+    function startHostJob(path, params, then) {
+      return withTargets(params).then(function (p) { return start(path, p, then); });
+    }
+
+    /**
+     * The array's portals next to the cluster's Morpheus iSCSI targets. A portal every host reaches directly but that
+     * is not a Morpheus target can be added here, as the user: Morpheus then logs every host in to it, as it does for a
+     * target added under the cluster's Storage > iSCSI Targets.
+     */
+    function loadTargets() {
+      show('targets', el('div', { 'class': 'muted', text: 'Reading the cluster\'s Morpheus iSCSI targets and how each host reaches the array portals...' }));
+      return Promise.all([morpheusTargets(), call('portal-routes')]).then(function (r) {
+        var have = r[0], reach = r[1];
+        if (have === null) { show('targets', el('div', { 'class': 'muted', text: 'Morpheus did not list this cluster\'s iSCSI targets for your user.' })); return; }
+        var missing = reach.portals.filter(function (p) { return p.everyHost && have.indexOf(p.portal) < 0; }).map(function (p) { return p.portal; });
+        var rows = reach.portals.map(function (p) {
+          var isTarget = have.indexOf(p.portal) >= 0;
+          var how = p.everyHost ? 'direct from every host'
+            : (p.direct.length ? 'direct from ' + p.direct.join(', ') : '') + (p.gatewayed.length ? (p.direct.length ? '; ' : '') + 'via a gateway from ' + p.gatewayed.join(', ') + ' (not a storage path)' : '') +
+              (p.unreachable.length ? '; no route from ' + p.unreachable.join(', ') : '');
+          return [p.portal, how, el('span', { 'class': isTarget ? 'st-PASS' : (p.everyHost ? 'st-FAIL' : 'st-NA'), text: isTarget ? 'Morpheus target' : (p.everyHost ? 'not a Morpheus target' : 'not used') })];
+        });
+        var extra = have.filter(function (a) { return !reach.portals.some(function (p) { return p.portal === a; }); });
+        var addBtn = missing.length ? adm(btn('Add ' + missing.length + ' as Morpheus iSCSI target(s)', function () {
+          if (!confirm('Add ' + missing.join(', ') + ' to this cluster\'s iSCSI targets in Morpheus?\n\nMorpheus logs every host in to each one (hvmcli storage iscsi configure), host by host; it can take a minute per host. The change is made as you.')) return;
+          var log = el('pre', { text: '' });
+          show('targets', log);
+          missing.reduce(function (chain, ip) {
+            return chain.then(function () {
+              log.textContent += 'Adding ' + ip + ' (Morpheus is logging every host in)...\n';
+              return mapi('POST', '/api/clusters/' + clusterId + '/iscsi-targets', new URLSearchParams({ 'iscsiTarget.targetIp': ip, 'iscsiTarget.targetPort': '3260' }))
+                .then(function () { log.textContent += '  added\n'; }, function (e) { log.textContent += '  FAILED: ' + e.message + '\n'; });
+            });
+          }, Promise.resolve()).then(function () { loadTargets(); loadHosts(); });
+        }, 'btn-primary')) : null;
+        show('targets', el('div', {}, [
+          table(['Array portal', 'Reached', 'In Morpheus'], rows),
+          extra.length ? el('div', { 'class': 'muted', text: 'Other Morpheus targets on this cluster (not this array): ' + extra.join(', ') }) : null,
+          el('div', { 'class': 'row' }, [missing.length ? 'Every host reaches these but Morpheus does not manage them: ' + missing.join(', ') + ' ' : 'Morpheus manages every portal the hosts reach directly. ', actions([addBtn, btn('Refresh', loadTargets)])]),
+          el('div', { 'class': 'muted', text: 'Host jobs (Add, Remediate, a host joining) connect a host only to these Morpheus targets, with the command Morpheus uses.' })
+        ]));
+      }).catch(function (e) { err('targets', e); });
+    }
+
     /** Storage-server name of a linked array, for labels. */
     function arrayName(sid) {
       var l = ((state.status && state.status.links) || []).filter(function (x) { return String(x.storageServerId) === String(sid); })[0];
@@ -105,6 +164,7 @@
         renderRecoveries(s);
         (s.jobs || []).forEach(function (j) { if (j.state === 'running') watch(j); else renderJob(j); });
         if (!state.hostsLoaded) { state.hostsLoaded = true; loadHosts(); }
+        if (!state.targetsLoaded) { state.targetsLoaded = true; loadTargets(); }
         if (!state.policiesLoaded) { state.policiesLoaded = true; loadPolicies(); }
       }).catch(function (e) { err('array', e); });
     }
@@ -422,12 +482,13 @@
     /** Compliance results per host, with Remediate for the automatic fixes of everything that did not pass. */
     function renderCompliance(target, hosts) {
       lib.put(target, el('div', {}, hosts.reduce(function (out, h) {
-        var fixes = []; h.results.forEach(function (r) { if (r.status !== 'PASS' && r.fix && fixes.indexOf(r.fix) < 0) fixes.push(r.fix); });
+        // only failing or warning checks: a not-applicable one has nothing to fix (the server drops those fixes too)
+        var fixes = []; h.results.forEach(function (r) { if ((r.status === 'FAIL' || r.status === 'WARN') && r.fix && fixes.indexOf(r.fix) < 0) fixes.push(r.fix); });
         var head = el('div', { 'class': 'row' }, [el('strong', { text: h.host }), ' Ubuntu ' + (h.os || '?') + ', kernel ' + (h.kernel || '?') + ' - ' + h.failed + ' failing',
           h.error ? el('span', { 'class': 'err', text: h.error }) : null]);
         if (fixes.length && adm(true)) head.appendChild(btn('Remediate (' + fixes.join(', ') + ')', function () {
-          if (confirm('Apply on ' + h.host + ': ' + fixes.join(', ') + '?\nAdds drop-in config and missing sessions only; never logs out sessions.'))
-            start('remediate', { host: h.host, fixes: fixes.join(',') });
+          if (confirm('Apply on ' + h.host + ': ' + fixes.join(', ') + '?\nAdds drop-in config and missing sessions only (to this cluster\'s Morpheus iSCSI targets, the way Morpheus does); never logs out sessions.'))
+            startHostJob('remediate', { host: h.host, fixes: fixes.join(',') });
         }, 'btn-warning'));
         return out.concat([head, table(['Check', 'Severity', 'Status', 'Observed', 'Expected'], h.results.map(function (r) {
           // a manual fix (hint) shows under what is expected
@@ -492,9 +553,12 @@
         var rows = hs.hosts.map(function (h) {
           var cells = h.arrays.map(function (x) {
             var st = HOST_STATE[x.action] || ['st-NA', x.action];
-            var add = PENDING.indexOf(x.action) >= 0 && adm(true) ? btn('Add', function () {
-              if (confirm('Add ' + h.node + ' to its host group on ' + arrayName(x.storageServerId) + ', then rescan it so the cluster LUNs appear?'))
-                start('host-add', { host: h.node, storageServerId: x.storageServerId }, function () { loadHosts(); });
+            // a host without an initiator name can be added too: Add sets up its iSCSI first, the way Morpheus does
+            var noIqn = x.action === 'UNKNOWN' && /initiator name/.test(x.detail || '');
+            var add = (PENDING.indexOf(x.action) >= 0 || noIqn) && adm(true) ? btn('Add', function () {
+              if (confirm('Set up ' + h.node + '\'s iSCSI where it is missing (Morpheus\'s initiator name, sessions to the cluster\'s Morpheus iSCSI targets), add it to its host group on ' +
+                  arrayName(x.storageServerId) + ', then rescan it so the cluster LUNs appear?'))
+                startHostJob('host-add', { host: h.node, storageServerId: x.storageServerId }, function () { loadHosts(); loadTargets(); });
             }, 'btn-primary') : null;
             return el('div', {}, [actions([el('span', { 'class': st[0], text: st[1], title: x.detail }), add]),
               x.arrayHost ? el('div', { 'class': 'muted', text: x.arrayHost }) : '']);

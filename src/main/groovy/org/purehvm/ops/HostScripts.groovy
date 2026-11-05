@@ -60,7 +60,7 @@ class HostScripts {
      * big output into an early-exiting reader: under pipefail that SIGPIPEs the writer and fails the pipeline.
      */
     private static final String HEADER = '''set -uo pipefail
-export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 lt() { tunegfs2 -l "$1" 2>/dev/null | sed -n 's/^[Ll]ock [Tt]able[^:]*: *//p' | head -1; }
 paths_of() { multipathd show paths raw format '%w %d' 2>/dev/null | awk -v w="$1" '$1==w {print $2}'; }
 healthy_paths() { multipathd show paths raw format '%w %t %T' 2>/dev/null | awk -v w="$1" '$1==w && $2=="active" && $3=="ready"' | wc -l; }

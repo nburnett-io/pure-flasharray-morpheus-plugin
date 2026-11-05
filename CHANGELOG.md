@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.13.0 (2026-11-05)
+
+**Hosts with no iSCSI set up yet, and iSCSI that follows Morpheus.** On HVM 2.0 Morpheus builds a host's iSCSI
+networking and initiator name when it adds the host, and logs every host in to each cluster iSCSI target with
+`hvmcli storage iscsi configure --portal <ip>:3260`. Until now the plugin could only finish iSCSI on a host that already
+had some: on a host with no sessions or node records, Remediate stopped at its first `iscsiadm` call.
+
+- **Fix: Remediate works on a host with no iSCSI state.** `iscsiadm` exits 21 ("no records found") when there is
+  nothing to list; the node-records and session-rescan steps treated that as a failure under `set -e`. Reproduced on a
+  test host with its iSCSI records hidden: the 0.12.1 step exits 21, the 0.13.0 steps finish.
+- **Fix: a check that does not apply offers no fix.** Remediate collected the fix of every result that was not PASS,
+  so a new host (no node records: ISC-04/06 not applicable) was sent `node-startup`, the step that failed. Only FAIL and
+  WARN results carry a fix now, in the checker and in the tab.
+- **Fix: the host scripts find `hvmcli`.** HVM installs it in `/usr/local/bin`, which the probe's and the scripts' fixed
+  `PATH` left out, so the probe reported no `hvmcli` on every host (and the MTU hint fell back to the netplan file).
+- **Sessions the way Morpheus makes them.** On a host with `hvmcli`, Remediate's sessions step runs Morpheus's own
+  command, `hvmcli storage iscsi configure --portal`, for each portal without a logged-in session, and only for the
+  cluster's Morpheus iSCSI targets when they are known (the tab reads them as the user). It no longer creates iSCSI
+  ifaces or logs in by itself there; the per-NIC iface check (ISC-02) points to the host's iSCSI virtual switch instead.
+  Hosts without `hvmcli` (HVM 1.3) keep the `iscsiadm` path, now idempotent about existing iface records.
+- **The initiator name is Morpheus's.** A host with no initiator name gets the IQN Morpheus has on record for it; a new
+  HPE-style name is made only when Morpheus has none, and is written back to the Morpheus record. An existing name is
+  still never replaced.
+- **Adding a host sets up its iSCSI first.** Add (in the Hosts table) and the automatic add when a host joins the
+  cluster now apply every failing automatic fix (packages, initiator name, services, multipath and udev drop-ins, ARP
+  sysctls, sessions, node records) before the array step, then add the host to the host group with its real IQN and
+  rescan. Sessions follow the Morpheus targets the other hosts are logged in to. A host with no IQN shows an Add button.
+- **New tab section: iSCSI targets (Morpheus).** Each array portal, how every host reaches it, and whether it is a
+  Morpheus iSCSI target of the cluster. Portals every host reaches directly but Morpheus does not manage can be added to
+  Morpheus from there, as the user; Morpheus then logs every host in. New read-only route `portal-routes`.
+- `apt-get install` refreshes the package lists and retries once when it fails.
+
+Verified on test systems: the empty-host steps in a mount namespace with every iSCSI record hidden (HVM 1.3 and 2.0 test
+hosts); Morpheus's initiator name written back on a 2.0 test host after its name was removed; `hvmcli configure` through
+the new step against a live target (idempotent); on a test cluster, the new route, compliance with `hvmcli` detected,
+Remediate following the four Morpheus targets (all already up) and Add host end to end (already set up, already in the
+host group, rescan, datastore mounted). Not yet seen: a real host joining with no sessions to the FlashArray.
+
 ## 0.12.1 (2026-11-01)
 
 - Wording only: MP-03's hint, the *Multipath no_path_retry* help text and the docs now describe the path-drop test
