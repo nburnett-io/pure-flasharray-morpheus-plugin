@@ -2,52 +2,45 @@
 
 Roughly in priority order.
 
-0. **`no_path_retry` on GFS2: what is still unproven (0.12.0).**
+0. **`no_path_retry` on GFS2: what is still unproven.**
    - Question for Pure and HPE: what should `no_path_retry` be on GFS2? The default of the *Multipath no_path_retry*
-     setting follows their answer.
+     setting follows their answer. If they answer 0, *Multipath: allow lowering to 0* (0.13.5) takes hosts back to it.
    - Test on a test array with a real controller failover and a timing host: the longest all-paths window. Done so far
      on a nested host with a 40 s drop of its one path: `fail` withdraws GFS2 at the first failed journal write (15 s in)
-     and the Morpheus agent reboots the host 1 min 46 s later (`wall 'HVM Cluster Quorum Recovered - Rebooting Host in
-     5 seconds.'`, then `reboot -f` with a sysrq-b backstop); `12` holds and resumes. Still open: a finite value whose
-     retries run out, and the other hosts while the rebooted host rejoins (corosync on a survivor logged a token timeout
-     and a 72 s consensus wait; dlm_controld "daemon joined 3 needs fencing" cleared in 7 s).
+     and the Morpheus agent reboots the host 1 min 46 s later; `12` holds and resumes. Still open: a finite value whose
+     retries run out, and the other hosts while the rebooted host rejoins.
    - The withdrawn node's GFS2 journal is not replayed by the survivors (the node leaves the lockspace cleanly); it is
-     replayed only when that node remounts. Observed gap: about 3.5 minutes. A host that never comes back leaves it
-     unreplayed. That is a cluster-level matter for the HVM Cluster Health plugin, noted here because `fail` is what
-     triggers it.
-   - Done on a 26.04 test host (multipath-tools 0.14.3): after `hvmcli storage multipath apply`, twice, once with a
-     PURE entry in the staged file, `/etc/multipath/conf.d/pure.conf` was untouched and `multipath -t` still showed its
-     values. Not repeated on 24.04 (0.9.4), where the directory is compiled in too.
-   - Decide how a host goes back to 0 if the vendors answer 0: Remediate never lowers a finite value, so today that means
-     editing the drop-in by hand. An explicit "allow lowering to 0" option is the likely answer.
-   - The job log does not say when an out-of-range setting (say `90` or `queue`) was treated as 0; the help text does.
-   - The probe does not read a `multipaths {}` section, which beats `overrides` for one WWID.
-   - During an all-paths window on a finite map, `blkid` in the probe blocks until the window ends, because it reads the
-     device (with `queue`, for ever). Skip maps with no usable path if that proves a problem.
-1. **Cluster membership events.** ADD_WORKER sets up the host's iSCSI (0.13.0), adds it to the host group and rescans.
-   Still open:
-   - Prove it on a real host joining with no FlashArray sessions (the nested test hosts cannot reach the array's iSCSI
-     subnets).
-   - Morpheus builds the iSCSI virtual switch when it adds a host. If ADD_WORKER fires before that switch is up, the
-     sessions step finds no route and the host waits for Morpheus's own pass (or Add). A retry after a few minutes may
-     be needed.
-   - REMOVE_WORKER only logs; the array host stays in the host group until removed on the array.
-   - Learned while testing: one iSCSI iface record bound to a missing NIC makes `hvmcli storage iscsi configure` (and so
-     Morpheus's own target set-up) fail on that host. A compliance check for unusable iface records would catch it.
-2. **Storage server sync.** In `refreshStorageServer`, sync array hosts, host groups and volumes into
-   `StorageHost` / `StorageHostGroup` / `StorageVolume` with SyncTask, so they show under Infrastructure > Storage.
-3. **Stale recovery sweeper.** Find `role=recovery-clone` volumes older than N hours (tag `created`) whose host has no
-   mount, and offer cleanup.
-4. **Persistent jobs.** Job state is in memory today. Persist it, or use Morpheus process events
-   (`morpheus.services.process`), so the history survives an appliance restart.
-5. **Application-consistent snapshots.** `virsh domfsfreeze` on all VMs on the datastore across hosts in parallel, then
-   a protection-group snapshot, then thaw. Never freeze the host filesystem.
+     replayed only when that node remounts. A cluster-level matter for the HVM Cluster Health plugin.
+   - The finite value must fit the host's `polling_interval`: tolerance is about 20 s + N x polling_interval, and hosts
+     built by hand can have 10 instead of 5. MP-03 warns above the tolerance setting.
+   - Done in 0.13.5: lowering option, job log for an out-of-range setting, `multipaths {}` entries (MP-03c), no `blkid`
+     on a map without a usable path.
+1. **Cluster membership events.** ADD_WORKER sets up the host's iSCSI and adds it to the host group; since 0.13.5 it
+   waits (up to 10 minutes) for the host to reach a portal, removes dead iface records first (ISC-07), and REMOVE_WORKER
+   writes an audit entry. Still open:
+   - Prove it on a real host joining with no FlashArray sessions.
+   - REMOVE_WORKER never removes the array host (it may still have GFS2 mounted); removal stays manual.
+2. **Storage server sync.** Sync array hosts, host groups and volumes into `StorageHost` / `StorageHostGroup` /
+   `StorageVolume` (plugin API 1.5.0 has the models and services, and SyncTask). Not started: no public plugin does this
+   for a storage server, which fields the Storage pages need is unknown, and volume records may offer Morpheus volume
+   actions the plugin does not implement. Needs a design pass and a test of what the pages show and allow.
+3. **Stale recovery sweeper.** Done in 0.13.5: clones without an expiry get one; clones no linked cluster owns are
+   listed (Leftover recovery clones) with a safe Remove.
+4. **Persistent jobs.** Done in 0.13.5: finished jobs are kept in the cluster's config (last 15). Plugin API 1.5.0 cannot
+   put them in Morpheus's own process history (no process for a cluster or storage server). A job running during a
+   restart still loses its progress view.
+5. **Application-consistent snapshots.** Done in 0.13.5, off by default. Not yet run against live guests: turn it on in a
+   test cluster with a VM that has the qemu guest agent and one that has not.
 6. **Protection groups.** Showing them is done (0.10.0, read only). Editing pgroups or default protection on create
-   is not wanted: policies stay on the array.
-7. **Restore to instance.** After "restore disk as new file", attach the file to a stopped copy of the VM through
-   Morpheus instead of by hand.
-8. **Task providers.** Workflow tasks for create LUN, grow, snapshot and recovery, for automation and approvals.
-9. **Cluster package.** `ComputeTypePackageProvider` "Pure iSCSI" so new clusters get the host baseline at build time.
+   is not wanted: policies stay on the array. Nothing to do.
+7. **Restore to instance.** Covered by the instance Restore tab since 0.7: overwrite, add as a new disk, file recovery
+   and clone to a new (stopped) VM go through Morpheus. The operator recovery session's "restore as new file" stays the
+   expert path.
+8. **Task providers.** Done in 0.13.5 for snapshots ("Pure FlashArray snapshot" workflow task, verified on a test
+   appliance). Create LUN, grow and recovery as tasks: only if someone needs them in a workflow.
+9. **Cluster package.** `ComputeTypePackageProvider` exists in 1.5.0 and can target HVM (MVM) clusters, but the plugin
+   does not own the HVM cluster layout, and since HVM 2.0 builds the iSCSI networking and initiator name itself and the
+   plugin sets up a joining host (item 1), a package adds little. Parked.
 10. **Capacity and performance.** Array volume space and performance (`/volumes/space`, `/volumes/performance`) on the
     tab.
 11. **Auth.** Purity OAuth2 API-client (JWT) as an alternative to API tokens.
@@ -56,3 +49,6 @@ Roughly in priority order.
     the current design; revisit once HPE re-lands a GFS2/volume-group plugin API.
 14. **Pure1 / VM Analytics.** Ask Pure whether Pure1 VM Analytics can ingest an HVM (KVM) topology. The collector is
     vCenter-only.
+15. **Duplicate sessions (ISC-03c).** A host logged in to each portal on both `default` and a virtual-switch iface has
+    twice the paths over the same NICs. Decide whether the plugin should offer to log the extra ones out (disruptive
+    only if done wrong; a maintenance-window action).

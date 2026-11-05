@@ -70,11 +70,16 @@ class ComplianceMonitor {
         s?.isInteger() && (s as Integer) > 0 ? s as Integer : ComplianceChecker.DEFAULT_TOLERANCE_WARN_SECONDS
     }
 
+    /** The "Multipath: allow lowering to 0" setting. */
+    static boolean allowZero(Map settings) {
+        settings?.multipathAllowZero in [true, 'on', 'true']
+    }
+
     /** Probes every host (or only {@code only}) in parallel and checks it; one entry per host, as the tab shows it. */
     static List<Map> check(PureClusterContext ctx, String only = null, Map settings = [:]) {
         Map info = arrayFacts(ctx)
         ComplianceChecker.Context cc = new ComplianceChecker.Context(info.portals as List<String>, info.iqns as Set<String>, info.purity as String,
-                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings))
+                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings))
         ctx.onAllHosts(probe(info.portals as List<String>), only ? [only] : ctx.hostNames).collect { String h, HostRunner.Result res ->
             hostView(h, res, cc)
         }

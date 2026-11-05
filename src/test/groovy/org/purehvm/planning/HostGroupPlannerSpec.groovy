@@ -167,4 +167,35 @@ class HostGroupPlannerSpec extends Specification {
         p.hosts.find { it.node == 'hvm-node03' }.action == Action.CREATE
         p.hosts.find { it.node == 'hvm-node03' }.arrayHost == 'hvm-node03-iscsi'
     }
+    def 'a cluster name taken by an old host group: by default a new name, on request the old group becomes <name>-old'() {
+        given: 'the group of an old cluster, with its own hosts, holds the name'
+        def old = [new ArrayHost('esx01', ['iqn.1998-01.com.vmware:esx01'], 'cluster-a', 0)]
+
+        when:
+        def keep = planner.plan('cluster-a', nodes, old, ['cluster-a'])
+        def rename = planner.plan('cluster-a', nodes, old, ['cluster-a', 'cluster-a-old'], null, true)
+
+        then: 'without the option nothing is renamed and the offer is shown'
+        keep.hostGroup != 'cluster-a' && !keep.renameExisting
+        keep.nameTaken == 'cluster-a' && keep.renameTo == 'cluster-a-old'
+        keep.warnings.any { it.contains('or rename the existing one to cluster-a-old') }
+
+        and: 'with it the old group is renamed (skipping a taken -old name) and the cluster gets the name'
+        rename.renameExisting && rename.createHostGroup
+        rename.hostGroup == 'cluster-a'
+        rename.renameTo == 'cluster-a-old-2'
+        rename.strayHosts.isEmpty()                      // esx01 leaves with the old group
+        rename.hosts*.action == [Action.CREATE] * 3
+    }
+
+    def 'nothing is renamed when the cluster already uses its group'() {
+        given:
+        def hosts = nodes.collect { new ArrayHost(it.name.tokenize('.')[0], it.iqns, 'cluster-a', 0) }
+
+        when:
+        def p = planner.plan('cluster-a', nodes, hosts, ['cluster-a'], null, true)
+
+        then:
+        !p.renameExisting && p.nameTaken == null && p.noop
+    }
 }

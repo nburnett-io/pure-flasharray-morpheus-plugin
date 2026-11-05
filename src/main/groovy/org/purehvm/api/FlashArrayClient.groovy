@@ -458,6 +458,11 @@ class FlashArrayClient implements Closeable {
     }
 
     /** Purity refuses to delete a host group that still has members or volume connections. */
+    /** Renames a host group; its hosts and volume connections stay. */
+    void renameHostGroup(String name, String newName) {
+        call('PATCH', 'host-groups', [names: name], [name: newName])
+    }
+
     void deleteHostGroup(String name) {
         call('DELETE', 'host-groups', [names: name])
     }

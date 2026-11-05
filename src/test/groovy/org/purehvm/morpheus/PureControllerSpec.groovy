@@ -59,7 +59,7 @@ class PureControllerSpec extends Specification {
         expect:
         PureController.adminMethods(routes) == ['link', 'unlink', 'hostGroupApply', 'remediate', 'datastoreCreate', 'datastoreGrow', 'cloneDatastore',
                                                 'hostAdd', 'hostMount', 'hostRescan', 'adopt', 'arrayHostRemove', 'iqnSync', 'retireFinish',
-                                                'retireMorpheus', 'datastoreShare', 'reclaimDelete'] as Set
+                                                'retireMorpheus', 'datastoreShare', 'reclaimDelete', 'recoveryOrphanRemove'] as Set
         // engineers (Operations: full) keep every snapshot restore
         routes.findAll { it.method in ['snapshotCreate', 'recoveryOpen', 'recoveryRestore', 'recoveryRestoreVm', 'recoveryClose', 'recoveryExtend'] }
                 .every { r -> r.permissions*.code == [PureController.PERM] && r.permissions.collect { it.availableAccessTypes*.toString() } == [['full']] }

@@ -582,7 +582,7 @@ hvmbr0.62|198.51.100.21/24
 
         then:
         s.contains('iscsi_ok() { local rc=0; "$@" || rc=$?; [ "$rc" -eq 0 ] || [ "$rc" -eq 21 ] || return "$rc"; }')
-        s.contains('{ iscsi_ok iscsiadm -m node 2>/dev/null; } | awk')
+        s.contains('{ iscsi_ok iscsiadm -m node -P1 2>/dev/null; } | awk')
         s.contains('iscsi_ok iscsiadm -m session --rescan')
         !(s =~ /(?m)^iscsiadm -m session --rescan/)
     }

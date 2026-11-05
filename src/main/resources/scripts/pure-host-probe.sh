@@ -14,7 +14,7 @@ sec services; for s in iscsid multipathd; do echo "$s|$(systemctl is-active $s 2
 sec iqn;      sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi 2>/dev/null
 sec ifaces;   iscsiadm -m iface 2>/dev/null
 sec sessions; iscsiadm -m session -P1 2>/dev/null | grep -E '^Target:|Current Portal:|Iface Name:|iSCSI Session State:|Iface Netdev:'
-sec nodes;    iscsiadm -m node -o show 2>/dev/null | grep -E '^(# BEGIN RECORD|# END RECORD|node\.name|node\.conn\[0\]\.address|node\.startup|iface\.iscsi_ifacename|iface\.net_ifacename|node\.conn\[0\]\.timeo\.noop_out_interval|node\.conn\[0\]\.timeo\.noop_out_timeout) '
+sec nodes;    iscsiadm -m node -o show 2>/dev/null | grep -E '^(# BEGIN RECORD|# END RECORD|node\.name|node\.conn\[0\]\.address|node\.startup|iface\.iscsi_ifacename|iface\.net_ifacename|node\.conn\[0\]\.timeo\.noop_out_interval|node\.conn\[0\]\.timeo\.noop_out_timeout)( |$)'
 sec mpconf
 multipath -t 2>/dev/null | awk '
   /^[[:space:]]*device \{/ {blk=$0 "\n"; dev=1; pure=0; next}
@@ -26,6 +26,15 @@ multipath -t 2>/dev/null | awk '
   /^overrides \{/ {s="overrides"; next}
   /^[^[:space:]]/ {s=""; next}
   s && ($1 == "no_path_retry" || (s == "defaults" && $1 == "polling_interval")) {gsub(/"/, "", $2); print s "|" $1 "|" $2}'
+# wwid|no_path_retry of each multipaths{} entry that sets it: such an entry beats overrides, device and defaults for that map
+sec mpentries
+multipath -t 2>/dev/null | awk '
+  /^multipaths \{/ {m=1; next}
+  m && /^\}/ {m=0}
+  m && $1 == "multipath" {w=""; r=""}
+  m && $1 == "wwid" {gsub(/"/, "", $2); w=$2}
+  m && $1 == "no_path_retry" {gsub(/"/, "", $2); r=$2}
+  m && /^[[:space:]]+\}/ {if (w != "" && r != "") print w "|" r; w=""; r=""}'
 sec maps;     multipathd show maps raw format "%w|%n|%Q|%N" 2>/dev/null
 sec paths;    multipathd show paths raw format "%w|%d|%t|%T|%p|%s" 2>/dev/null
 sec sysfs
@@ -58,13 +67,18 @@ done
 sec gfs2mounts; findmnt -t gfs2 -rn -o SOURCE,TARGET,OPTIONS 2>/dev/null
 sec gfs2withdraw; for f in /sys/fs/gfs2/*/withdraw; do [ -e "$f" ] && echo "$(basename $(dirname $f))|$(cat $f)"; done
 sec gfs2tables
+# blkid reads the device: on a map with no usable path it would block until the paths return (for ever with queue)
+USABLE=$(multipathd show paths raw format "%w|%T" 2>/dev/null | awk -F'|' '$2 ~ /ready|ghost/ {print $1}' | sort -u)
 for dev in /dev/mapper/3624a937*; do
   [ -e "$dev" ] || continue
-  if blkid -p -o value -s TYPE "$dev" 2>/dev/null | grep -qx gfs2; then
-    echo "$dev|$(tunegfs2 -l "$dev" 2>/dev/null | sed -n 's/^[Ll]ock [Tt]able[^:]*: *//p' | head -1)"
+  echo "$USABLE" | grep -qx "$(basename "$dev")" || continue
+  if timeout 15 blkid -p -o value -s TYPE "$dev" 2>/dev/null | grep -qx gfs2; then
+    echo "$dev|$(timeout 15 tunegfs2 -l "$dev" 2>/dev/null | sed -n 's/^[Ll]ock [Tt]able[^:]*: *//p' | head -1)"
   fi
 done
 # libvirt storage pools: name|target path|state
 sec pools;    for p in $(virsh pool-list --all --name 2>/dev/null); do echo "$p|$(virsh pool-dumpxml "$p" 2>/dev/null | sed -n 's:.*<path>\(.*\)</path>.*:\1:p' | head -1)|$(virsh pool-info "$p" 2>/dev/null | awk -F': *' '/^State/ {print $2}')"; done
 sec hvmcli;   command -v hvmcli 2>/dev/null
+# interface|operstate: an iSCSI iface bound to a missing or down NIC makes an unbound discovery time out
+sec linkstate; for n in /sys/class/net/*; do echo "$(basename "$n")|$(cat "$n/operstate" 2>/dev/null)"; done
 sec end

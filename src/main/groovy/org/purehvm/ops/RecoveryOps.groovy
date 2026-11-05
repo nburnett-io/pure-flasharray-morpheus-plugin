@@ -64,10 +64,14 @@ class RecoveryOps {
         }.sort { -((it.created ?: 0) as Long) }
     }
 
-    String snapshot(String volume, String suffix = null) {
+    static void requireSuffix(String suffix) {
         if (suffix && !(suffix ==~ /[A-Za-z0-9-]{1,63}/ && suffix =~ /[A-Za-z]/)) {
             throw new IllegalArgumentException('Snapshot suffix: 1-63 letters, digits or -, with at least one letter')
         }
+    }
+
+    String snapshot(String volume, String suffix = null) {
+        requireSuffix(suffix)
         String name = fa.createVolumeSnapshot([volume], suffix).find()?.name
         step("snapshot ${name} created")
         name

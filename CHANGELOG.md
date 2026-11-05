@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.13.5 (2026-11-05)
+
+**Unused iSCSI records, host-group names, and most of the backlog.**
+
+- **Fix: Remediate no longer adds sessions at the next boot.** The node-records fix (ISC-04/ISC-06) updated every
+  FlashArray node record of a portal, including spare ones that no session uses (left by an older plugin's iface
+  records, or by a rebuilt iSCSI virtual switch). Set to automatic, they log in at boot next to the records in use and
+  the host comes up with extra paths. It now updates only the record each live session uses, by iface, and ISC-04/06
+  judge only those.
+- **New check ISC-07: unused or dead iSCSI records**, with a fix. Spare node records (not logged in while their portal
+  has a session through another iface), iface records bound to a NIC that is missing, down or has no address (a rebuilt
+  virtual switch leaves them, and they make `hvmcli storage iscsi configure` time out), and duplicate ifaces left with
+  nothing. The fix deletes them record by record, each only if no session uses it when the step runs; it never logs out
+  and never deletes by filter. FAIL when a dead iface would break Morpheus's own configure, otherwise WARN. It runs
+  before the sessions step, also on Add host and on a joining host. The probe now reads link states.
+- **Host group name taken by an old group: rename it to `<name>-old`.** When the cluster's name is already used by
+  another host group (an old cluster's), the Hosts section offers to rename that group to `<name>-old` (or `-old-2`...)
+  and create the cluster's group under the name, instead of `<name>-1`. A rename keeps the old group's hosts and volume
+  connections. Refused when any cluster is linked to the old group.
+- **A joining host waits for its iSCSI networking.** If ADD_WORKER arrives before the host reaches any array portal
+  (Morpheus still building the iSCSI virtual switch), the add waits, checking every 2 minutes for up to 10 minutes,
+  then runs. The wait is on a timer, not in a job, so the cluster's other operations are not held up. A host leaving the
+  cluster is now written to the audit log (its array host is still never removed automatically).
+- **Leftover recovery clones.** New section listing recovery clones on the cluster's arrays that no linked cluster owns
+  (its cluster was deleted or unlinked, its host is gone), which no timeout ever closes, with a Remove button: cleaned up
+  through its host when that host is in this cluster, otherwise only when nothing is connected; destroyed, not
+  eradicated. A cluster's clone with no expiry recorded now gets one.
+- **Operations history survives a restart.** Finished jobs (the end of their log) are kept in the cluster's config, the
+  last 15, and shown with the running ones.
+- **Application-consistent snapshots, off by default** (setting *Allow application-consistent snapshots*). When on, the
+  snapshot view offers to freeze the file systems of every running VM on the datastore (qemu guest agent, all hosts in
+  parallel), take the snapshot and thaw. A VM without an agent is skipped and reported. Before each freeze the host arms
+  a timer that thaws that guest after 60 s whatever happens to the plugin. The host GFS2 file system is never frozen.
+- **Workflow task "Pure FlashArray snapshot".** An array snapshot of the GFS2 datastore(s) a VM is on, for workflows
+  (for example before a change); optionally application-consistent when the setting above allows it.
+- **`no_path_retry` follow-ups.** New setting *Multipath: allow lowering to 0* (off): when on, a setting of 0 may
+  replace a host's finite value. The job log says when an out-of-range setting counts as 0. New check MP-03c reports a
+  `multipaths {}` entry that sets no_path_retry for a FlashArray LUN (it beats the drop-in). The probe no longer runs
+  `blkid`/`tunegfs2` on a map with no usable path (it could block), and bounds both with a timeout.
+- Fix: MP-03 offered Remediate for a finite setting that differs from the host's value but showed PASS, and only failing
+  or warning checks carry their fix, so the button never appeared. It is a WARN now.
+- Fix: the probe never read a node record on a real host. Its filter dropped the `# END RECORD` lines, so no record was
+  ever completed and ISC-04/ISC-06 showed "not applicable" on hosts that have records (the test data kept those lines).
+  The probe keeps them now, and the parser also ends a record where the next one begins.
+- Review fixes before release:
+  - A guest freeze that fails or times out is thawed straight away and keeps its 60 s safety timer, because the agent may
+    still finish the freeze after the client gives up. A thaw that fails keeps the timer too.
+  - Every host is frozen at once rather than in batches of 8. A snapshot is reported as not application-consistent when
+    the freeze-to-snapshot time passed the safety timer. A bad suffix is refused before anything is frozen.
+  - The workflow task runs only for an operator tenant of the cluster (master, the owning tenant, or *Operator tenants*),
+    as the cluster tab does. A task whose tenant is unknown is refused.
+  - ISC-07 removes an iface only when its NIC is missing or has no address. A NIC that is just down, such as a fabric in
+    maintenance or a bridge still coming up, is reported and its iface kept.
+  - A host joining while the cluster is busy is retried every 2 minutes, then given up with an audit entry, not dropped.
+  - Renaming a host group that looks like an HVM cluster's (HPE initiator names, or plugin-tagged volumes connected)
+    needs explicit confirmation, because a cluster on another appliance would not show up in this appliance's links.
+  - One cluster's failure no longer stops the background sweeper for the others.
+  - A record delete that fails in the cleanup is reported instead of failing the step.
+  - Link changes and job history no longer overwrite each other's cluster config.
+  - `hvmcli` and `virsh` read no stdin in the host scripts.
+- Fix: two sessions to one portal were read as one. `iscsiadm -m session -P1` lists every session to a portal under one
+  "Current Portal" heading, and the parser kept only the last interface, so a host logged in to each portal twice (on
+  `default` and on a virtual-switch iface) showed half its sessions next to twice the paths. New check ISC-03c warns
+  about two sessions to one portal over the same NIC (more paths, no more redundancy); no automatic fix.
+
 ## 0.13.1 (2026-11-05)
 
 - **Fix: sessions on a host where `hvmcli storage iscsi configure` times out although the array answers.** hvmcli's

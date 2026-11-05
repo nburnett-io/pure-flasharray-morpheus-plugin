@@ -26,10 +26,13 @@ class Remediation {
         s?.isInteger() && (s as Integer) in 1..60 ? String.valueOf(s as Integer) : '0'
     }
 
-    /** What the drop-in sets on this host: the setting, except that 0 never replaces a finite value the host already has. */
-    static String dropInNoPathRetry(String setting, HostFacts f) {
+    /**
+     * What the drop-in sets on this host: the setting, except that 0 never replaces a finite value the host already has
+     * unless lowering is explicitly allowed ("Multipath: allow lowering to 0").
+     */
+    static String dropInNoPathRetry(String setting, HostFacts f, boolean allowZero = false) {
         String host = f.noPathRetry.value
-        setting == '0' && ComplianceChecker.finiteRetry(host) ? host : setting
+        setting == '0' && !allowZero && ComplianceChecker.finiteRetry(host) ? host : setting
     }
 
     static String multipathDropIn(boolean detectPrioNo, String noPathRetry = '0') {
@@ -154,9 +157,10 @@ fi
                 sb << "echo 'SKIP multipath: GFS2 mounted via alias device(s) ${aliasMounts*.source.join(' ')}; fix in a maintenance window'\n"
             } else {
                 boolean dp = ComplianceChecker.needsDetectPrioNo(f.packages['multipath-tools']?.version as String, purityVersion)
-                String retry = dropInNoPathRetry(noPathRetry, f)
+                String retry = dropInNoPathRetry(noPathRetry, f, morpheus.allowZero == true)
                 writeFile(sb, MULTIPATH_DROPIN, multipathDropIn(dp, retry))
-                String note = retry != noPathRetry ? " (kept from this host; the setting asks for ${noPathRetry})" : ''
+                String note = retry != noPathRetry ? " (kept from this host; the setting asks for ${noPathRetry})" :
+                        (morpheus.allowZero == true && retry == '0' && ComplianceChecker.finiteRetry(f.noPathRetry.value) ? " (lowered from ${f.noPathRetry.value}: lowering to 0 is allowed)" : '')
                 if (f.noPathRetry.source == 'overrides') { note += " (no effect: the overrides section sets ${f.noPathRetry.value})" }
                 sb << "echo 'no_path_retry ${retry}${note}'\n"
                 sb << 'multipathd reconfigure\n'
@@ -174,6 +178,13 @@ fi
             writeFile(sb, SYSCTL_DROPIN, sysctlDropIn(f.storageInterfaces))
             sb << "sysctl -q -p ${SYSCTL_DROPIN}\n"
             add('ARP sysctls', sb)
+        }
+        // before the sessions step: a dead iface makes hvmcli's discovery time out
+        if ('stale-iscsi-records' in want) {
+            StringBuilder sb = staleRecords(f)
+            if (sb) {
+                add('remove unused and dead iSCSI records (never a logged-in one)', sb)
+            }
         }
         if ('iscsi-sessions' in want) {
             if (f.hvmcli) {
@@ -193,15 +204,69 @@ fi
         }
         if ('node-startup' in want) {
             // a host with no node records yet makes `iscsiadm -m node` exit 21: nothing to update
-            add('node records: startup automatic, NOP-Out 5/5', new StringBuilder('''{ iscsi_ok iscsiadm -m node 2>/dev/null; } | awk '/purestorage/ {split($1,a,","); print a[1], $2}' | while read -r portal target; do
+            // Only the record each live session uses (per portal, per iface). A spare record of a portal that already has
+            // a session stays as it is: set to automatic it adds a duplicate session at the next boot.
+            add('node records: startup automatic, NOP-Out 5/5', new StringBuilder(LIVE_PAIRS + '''{ iscsi_ok iscsiadm -m node -P1 2>/dev/null; } | awk '/^Target:/ {t=$2} /^[[:space:]]+Portal:/ {split($2,a,","); p=a[1]} /Iface Name:/ {if (t ~ /purestorage/) print t, p, $3}' | while read -r target portal iface; do
+  ip="${portal%:*}"
+  if grep -q "^${ip}|" <<<"$LIVE" && ! grep -qxF "${ip}|${iface}" <<<"$LIVE"; then
+    echo "left ${ip} via ${iface} alone: the session to ${ip} uses another record"
+    continue
+  fi
   for kv in node.startup=automatic node.conn[0].timeo.noop_out_interval=5 node.conn[0].timeo.noop_out_timeout=5; do
-    iscsiadm -m node -T "$target" -p "$portal" -o update -n "${kv%%=*}" -v "${kv#*=}"
+    iscsiadm -m node -T "$target" -p "$portal" -I "$iface" -o update -n "${kv%%=*}" -v "${kv#*=}"
   done
 done
 echo "FlashArray node records: $({ iscsi_ok iscsiadm -m node 2>/dev/null; } | grep -c purestorage || true)"
 '''))
         }
         out
+    }
+
+    /** Sets LIVE to "portal-ip|iface" per logged-in session, read when the step runs (not from the probe). */
+    static final String LIVE_PAIRS = 'LIVE="$({ iscsi_ok iscsiadm -m session -P1 2>/dev/null; } | awk \'/Current Portal:/ {split($3,a,":"); p=a[1]} /Iface Name:/ {print p "|" $3}\')"\n'
+
+    private static boolean safeName(String s) {
+        s && s ==~ /[A-Za-z0-9._:\-]+/
+    }
+
+    private static boolean safeIp(String s) {
+        s && s ==~ /\d{1,3}(\.\d{1,3}){3}/
+    }
+
+    /**
+     * ISC-07's fix. Deletes, one by one, the spare node records and the records and iface entries of dead or duplicate
+     * ifaces the probe found, each only if no session uses it when the step runs. Never logs out, never deletes a
+     * record by filter (an `iscsiadm -m node -o delete` that ignored its filter would remove them all).
+     */
+    private static StringBuilder staleRecords(HostFacts f) {
+        StringBuilder sb = new StringBuilder(LIVE_PAIRS)
+        List<Map> spare = ComplianceChecker.spareNodes(f)
+        List<Map> dead = ComplianceChecker.deadIfaces(f)
+        List<Map> ifaces = dead + ComplianceChecker.redundantIfaces(f, spare, dead)
+        Set<String> ifaceNames = ifaces*.name as Set<String>
+        List<Map> records = spare + f.nodes.findAll { ifaceNames.contains(it['iface.iscsi_ifacename']) && !spare.any { s -> s.is(it) } }
+        int n = 0
+        records.each { Map r ->
+            String t = r['node.name'], p = r['node.conn[0].address'], i = r['iface.iscsi_ifacename']
+            if (!(safeIqn(t) && safeIp(p) && safeName(i))) {
+                sb << "echo 'SKIP a node record with unexpected characters; remove it by hand'\n"
+                return
+            }
+            n++
+            sb << "if grep -qxF '${p}|${i}' <<<\"\$LIVE\"; then echo 'kept ${p} via ${i}: logged in now'\n"
+            sb << "else iscsiadm -m node -T '${t}' -p '${p}:3260' -I '${i}' -o delete && echo 'removed unused node record ${p} via ${i}' || echo 'WARN could not delete node record ${p} via ${i}'; fi\n"
+        }
+        ifaces.each { Map x ->
+            String i = x.name, nd = x.netdev
+            if (!(safeName(i) && safeName(nd))) {
+                sb << "echo 'SKIP an iface record with unexpected characters; remove it by hand'\n"
+                return
+            }
+            n++
+            sb << "if grep -q '|${i}\$' <<<\"\$LIVE\"; then echo 'kept iface ${i}: a session uses it now'\n"
+            sb << "else iscsiadm -m iface -I '${i}' -o delete >/dev/null && echo 'removed iface ${i} (bound to ${nd}, unused)' || echo 'WARN could not delete iface ${i}'; fi\n"
+        }
+        n ? sb : new StringBuilder()
     }
 
     /** An unroutable portal is skipped with the reason; true when the portal is a storage path for this host. */
@@ -235,7 +300,7 @@ echo "FlashArray node records: $({ iscsi_ok iscsiadm -m node 2>/dev/null; } | gr
                 sb << "echo 'session to ${p} already up'\n"
                 return
             }
-            sb << "if OUT=\$(timeout ${HVMCLI_CONFIGURE_TIMEOUT_SEC} hvmcli storage iscsi configure --portal '${p}:3260' --json 2>&1); then\n"
+            sb << "if OUT=\$(timeout ${HVMCLI_CONFIGURE_TIMEOUT_SEC} hvmcli storage iscsi configure --portal '${p}:3260' --json </dev/null 2>&1); then\n"
             sb << "  echo 'logged in to ${p} (hvmcli storage iscsi configure, as Morpheus does)'\n"
             sb << "else\n  echo \"WARN hvmcli configure ${p} failed: \$(echo \"\$OUT\" | tr '\\n' ' ' | tail -c 300)\"\n"
             sb << defaultIfaceFallback(p)

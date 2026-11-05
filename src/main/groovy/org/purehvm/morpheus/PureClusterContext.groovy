@@ -189,10 +189,16 @@ class PureClusterContext {
     }
 
     private void saveLinks(List<Map> links) {
-        cluster.setConfigProperty(CFG_LINKS, links.collect { [storageServerId: it.storageServerId, hostGroup: it.hostGroup] })
-        cluster.setConfigProperty(CFG_STORAGE_SERVER, null)
-        cluster.setConfigProperty(CFG_HOST_GROUP, null)
-        morpheus.services.cluster.save(cluster)
+        // the save writes the whole config: change a fresh copy so job history written meanwhile (JobHistory) survives
+        synchronized (JobHistory.LOCK) {
+            ComputeServerGroup fresh = morpheus.services.cluster.get(cluster.id) ?: cluster
+            [fresh, cluster].unique { System.identityHashCode(it) }.each { ComputeServerGroup c ->
+                c.setConfigProperty(CFG_LINKS, links.collect { [storageServerId: it.storageServerId, hostGroup: it.hostGroup] })
+                c.setConfigProperty(CFG_STORAGE_SERVER, null)
+                c.setConfigProperty(CFG_HOST_GROUP, null)
+            }
+            morpheus.services.cluster.save(fresh)
+        }
     }
 
     /** Adds the link or updates its host group. Refuses a host group another cluster already uses on that array. */

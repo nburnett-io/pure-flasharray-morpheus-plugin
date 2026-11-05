@@ -7,9 +7,12 @@ import com.morpheusdata.model.Permission
 import com.morpheusdata.views.HandlebarsRenderer
 import org.purehvm.api.PureNames
 import org.purehvm.compliance.ComplianceChecker
+import org.purehvm.morpheus.JobHistory
+import org.purehvm.morpheus.Jobs
 import org.purehvm.morpheus.PureClusterTabProvider
 import org.purehvm.morpheus.PureController
 import org.purehvm.morpheus.PureInstanceTabProvider
+import org.purehvm.morpheus.PureSnapshotTaskProvider
 import org.purehvm.morpheus.PureStorageProvider
 import org.purehvm.morpheus.RecoverySessions
 import groovy.json.JsonSlurper
@@ -86,13 +89,19 @@ class PureFlashArrayPlugin extends Plugin {
                         helpText: 'What Remediate writes to the multipath drop-in: 0 (default, Pure\'s written value) or 1-60 retries. Changing this alters no host until someone runs Remediate on it. ' +
                                 'With 0, I/O fails about 20 s after all paths go, and on GFS2 that withdraws the filesystem and the host is reset about 2 minutes later (seen on a test host with a 40 s path drop). A number holds I/O for about 20 s + N x polling_interval first, so a short outage passes (12 held the same 40 s drop with no error), but guests hang for that long, and past HVM\'s own clocks (all-paths-down at about 2 minutes, host offline at 140 s) the effects are unknown. ' +
                                 'Nothing has been tested against a real controller failover. Pure and HPE have not said what GFS2 should use; this default follows their answer. ' +
-                                'Remediate never takes a host\'s finite value back to 0; anything other than 0 or 1-60 here counts as 0. Files in conf.d load after /etc/multipath.conf, so the drop-in beats a device value set with hvmcli.'),
+                                'Remediate never takes a host\'s finite value back to 0 (unless the next setting allows it); anything other than 0 or 1-60 here counts as 0. Files in conf.d load after /etc/multipath.conf, so the drop-in beats a device value set with hvmcli.'),
+                new OptionType(name: 'Multipath: allow lowering to 0', code: 'pure.multipathAllowZero', fieldName: 'multipathAllowZero',
+                        fieldLabel: 'Multipath: allow Remediate to lower no_path_retry to 0', inputType: OptionType.InputType.CHECKBOX, defaultValue: 'off', displayOrder: 39,
+                        helpText: 'Off (default): a host with a finite no_path_retry keeps it when the setting above is 0. On: the compliance check offers Remediate to write 0 on such hosts too, for when the vendors answer that GFS2 should fail I/O at once. Changes no host until someone runs Remediate.'),
                 new OptionType(name: 'Multipath tolerance warning (seconds)', code: 'pure.multipathToleranceWarnSeconds', fieldName: 'multipathToleranceWarnSeconds',
                         fieldLabel: 'Multipath tolerance warning (seconds)', inputType: OptionType.InputType.TEXT, defaultValue: String.valueOf(ComplianceChecker.DEFAULT_TOLERANCE_WARN_SECONDS), displayOrder: 39,
                         helpText: 'The compliance check warns when a host\'s finite no_path_retry would hold I/O longer than this (about 20 s + N x polling_interval). The default stays inside HVM\'s own storage-loss clocks (all-paths-down at about 2 minutes, host offline at 140 s).'),
                 new OptionType(name: 'Array tag namespace', code: 'pure.tagNamespace', fieldName: 'tagNamespace',
                         fieldLabel: 'Array tag namespace', inputType: OptionType.InputType.TEXT, defaultValue: PureNames.DEFAULT_TAG_NAMESPACE, displayOrder: 39,
                         helpText: 'Namespace of the tags the plugin writes on FlashArray volumes to recognise its datastores and recovery clones. Only volumes tagged in this namespace are managed. Keep the default for a new install; an install upgraded from an earlier build must keep the namespace its volumes already carry.'),
+                new OptionType(name: 'Application-consistent snapshots', code: 'pure.enableGuestFreeze', fieldName: 'enableGuestFreeze',
+                        fieldLabel: 'Allow application-consistent snapshots (freeze guests)', inputType: OptionType.InputType.CHECKBOX, defaultValue: 'off', displayOrder: 39,
+                        helpText: 'Off (default): snapshots are crash-consistent only. On: the cluster tab and the "Pure FlashArray snapshot" workflow task can freeze the file systems of every running VM on a datastore (qemu guest agent) for the moment of a snapshot. Guests pause writes for a few seconds; a host timer thaws each one after 60 s whatever happens.'),
                 new OptionType(name: 'Enable experimental operations', code: 'pure.enableExperimental', fieldName: 'enableExperimental',
                         fieldLabel: 'Enable experimental operations', inputType: OptionType.InputType.CHECKBOX, defaultValue: 'off', displayOrder: 40,
                         helpText: 'Clone a snapshot as a new datastore. Leave off until validated in a test environment.'),
@@ -101,6 +110,7 @@ class PureFlashArrayPlugin extends Plugin {
         registerProvider(new PureStorageProvider(this, morpheus))
         registerProvider(new PureClusterTabProvider(this, morpheus))
         registerProvider(new PureInstanceTabProvider(this, morpheus))
+        registerProvider(new PureSnapshotTaskProvider(this, morpheus))
         PureController controller = new PureController(this, morpheus)
         registerProvider(controller)
         controllers.add(controller)
@@ -110,10 +120,13 @@ class PureFlashArrayPlugin extends Plugin {
             // settings not readable yet; the sweeper and every request read them again
         }
         RecoverySessions.startSweeper(morpheus, this)
+        MorpheusContext ctx = morpheus
+        Jobs.onFinish = { Jobs.Job j -> JobHistory.record(ctx, j) }
     }
 
     @Override
     void onDestroy() {
+        Jobs.onFinish = null
         RecoverySessions.stopSweeper()
     }
 

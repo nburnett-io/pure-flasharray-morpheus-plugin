@@ -37,6 +37,7 @@ class ComplianceChecker {
         String purityVersion               // e.g. 6.10.4
         String noPathRetry = '0'           // what Remediate writes: see Remediation.noPathRetrySetting
         int toleranceWarnSeconds = DEFAULT_TOLERANCE_WARN_SECONDS
+        boolean allowLowerToZero = false    // "Multipath: allow lowering to 0": a setting of 0 may replace a host's finite value
     }
 
     /** Inside HVM's own storage-loss clocks: all-paths-down at about 2 minutes, host offline at 140 s. */
@@ -124,13 +125,30 @@ class ComplianceChecker {
             r << new Result('ISC-03b', 'Sessions use the interface on the portal\'s own fabric', Severity.MEDIUM, Status.WARN,
                     crossFabric.collect { "${it.portal} via ${it.viaNic}" }.join(', '), 'portal via its routed NIC', null)
         }
+        // two sessions to one portal over the same NIC (typically "default" plus a virtual-switch iface) double the paths
+        // without adding redundancy; logging one out is a maintenance-window decision, so no automatic fix
+        List<String> doubled = live.groupBy { "${it.portal}|${it.viaNic}".toString() }.findAll { k, v -> v.size() > 1 }
+                .collect { k, v -> "${v[0].portal} via ${v[0].viaNic ?: '?'} (${v*.iface.join(', ')})".toString() }
+        if (doubled) {
+            r << new Result('ISC-03c', 'One session per portal and NIC', Severity.LOW, Status.WARN, doubled.join('; '),
+                    'one session per portal on each storage NIC', null,
+                    'Extra sessions over the same NIC add paths but no redundancy. To drop one, log it out in a maintenance window (iscsiadm -m node -T <target> -p <portal> -I <iface> --logout) and set that record to manual; ISC-07 then removes it.')
+        }
         List<Map> unboundSessions = live.findAll { it.iface == 'default' }
         if (unboundSessions) {
             r << new Result('ISC-02b', 'Sessions bound to a named iface (not "default")', Severity.LOW, Status.WARN,
                     unboundSessions*.portal.join(', '), 'per-NIC iface (Morpheus UI targets use "default")', null)
         }
 
-        List<Map> pureNodes = f.nodes.findAll { (it['node.name'] as String)?.contains('purestorage') }
+        // records nobody uses (a spare duplicate of a live session, or one on a dead iface) are ISC-07's: judging them
+        // here made the node-startup fix switch them to automatic, and the host came up with extra sessions at boot
+        List<Map> spare = spareNodes(f)
+        List<Map> dead = deadIfaces(f)
+        List<Map> redundant = redundantIfaces(f, spare, dead)
+        Set<String> deadNames = dead*.name as Set<String>
+        List<Map> pureNodes = f.nodes.findAll { Map n ->
+            (n['node.name'] as String)?.contains('purestorage') && !spare.any { it.is(n) } && !deadNames.contains(n['iface.iscsi_ifacename'])
+        }
         List<Map> manual = pureNodes.findAll { it['node.startup'] != 'automatic' }
         r << new Result('ISC-04', 'node.startup = automatic for FlashArray targets', Severity.HIGH,
                 pureNodes ? (manual ? Status.FAIL : Status.PASS) : Status.NA,
@@ -140,6 +158,29 @@ class ComplianceChecker {
         }
         r << new Result('ISC-06', 'NOP-Out interval/timeout 5/5', Severity.MEDIUM, pureNodes ? (badNoop ? Status.WARN : Status.PASS) : Status.NA,
                 badNoop ? "${badNoop.size()} record(s) differ".toString() : '5/5', '5/5', 'node-startup')
+        List<String> unused = []
+        if (spare) {
+            unused << "spare node record(s) ${spare.collect { "${it['node.conn[0].address']} via ${it['iface.iscsi_ifacename']}" }.join(', ')}".toString()
+        }
+        if (dead) {
+            unused << "iface(s) on a missing, down or address-less NIC: ${dead.collect { "${it.name} (${it.netdev})" }.join(', ')}".toString()
+        }
+        if (redundant) {
+            unused << "unused duplicate iface(s): ${redundant.collect { "${it.name} (${it.netdev})" }.join(', ')}".toString()
+        }
+        boolean removable = !unused.isEmpty()
+        List<Map> down = downIfaces(f)
+        if (down) {
+            unused << "iface(s) without a session on a NIC that is down but addressed (kept: fabric down or still coming up): ${down.collect { "${it.name} (${it.netdev})" }.join(', ')}".toString()
+        }
+        // a dead iface breaks Morpheus's own `hvmcli storage iscsi configure` (its discovery tries every iface), so it fails
+        r << new Result('ISC-07', 'No unused or dead iSCSI records', Severity.MEDIUM,
+                unused ? (dead && f.hvmcli ? Status.FAIL : Status.WARN) : Status.PASS,
+                unused ? unused.join('; ') : 'none',
+                'every iface on a usable NIC; every FlashArray node record in use (a spare record can log in again at boot)',
+                removable ? 'stale-iscsi-records' : null,
+                dead && f.hvmcli ? 'A dead iface makes Morpheus\'s hvmcli configure time out on this host (its discovery tries every iface). Remediate removes it; live sessions are never touched.'
+                        : (down && !removable ? 'Check the storage NIC\'s link (cable, switch port, fabric maintenance); nothing is removed while it has its address.' : null))
 
         // ---- multipath (effective config)
         if (!f.mpPure) {
@@ -159,6 +200,14 @@ class ComplianceChecker {
             }
         }
         r << liveQueueingResult(f)
+        // a multipaths{} entry for one WWID beats overrides, the device entry and defaults for that map: the drop-in
+        // (and MP-03) cannot speak for it
+        Map<String, String> entries = f.mpEntries.findAll { k, v -> k.startsWith(org.purehvm.api.PureNames.WWID_PREFIX) }
+        if (entries) {
+            r << new Result('MP-03c', 'No per-LUN no_path_retry (multipaths section)', Severity.MEDIUM, Status.WARN,
+                    entries.collect { k, v -> "${k}: ${v}" }.join(', '), 'none: one value for every FlashArray map', null,
+                    'A multipaths entry sets no_path_retry for these LUNs only, and it beats the plugin\'s drop-in. Remove it from the multipath configuration unless it is deliberate.')
+        }
         List<Map> aliased = f.pureMaps.findAll { it.name != it.wwid }
         r << new Result('MP-05', 'Maps named by WWID (user_friendly_names no)', Severity.HIGH,
                 f.pureMaps ? (aliased ? Status.FAIL : Status.PASS) : Status.NA,
@@ -291,9 +340,12 @@ class ComplianceChecker {
             return result(Status.FAIL, value ?: 'unset', 'multipath', 'No readable value: set one explicitly, so every host in the cluster behaves the same.')
         }
         // a finite setting that differs from the host's finite value is the one case where Remediate changes a finite value
-        boolean settingDiffers = finiteRetry(ctx.noPathRetry) && ctx.noPathRetry != value
+        // ...and a setting of 0 when lowering is explicitly allowed
+        boolean lowerToZero = ctx.allowLowerToZero && ctx.noPathRetry == '0'
+        boolean settingDiffers = (finiteRetry(ctx.noPathRetry) && ctx.noPathRetry != value) || lowerToZero
         String settingFix = settingDiffers ? fix : null
-        String settingHint = settingDiffers ? (fix ? "The plugin setting asks for ${ctx.noPathRetry}: Remediate writes it." : "The plugin setting asks for ${ctx.noPathRetry}. ${overridesHint}") : ''
+        String asks = lowerToZero ? '0 and lowering is allowed' : ctx.noPathRetry
+        String settingHint = settingDiffers ? (fix ? "The plugin setting asks for ${asks}: Remediate writes it." : "The plugin setting asks for ${asks}. ${overridesHint}") : ''
         String polling = f.mpDefaults.polling_interval
         if (!polling?.isInteger()) {
             return result(Status.WARN, "${value}${from}; polling_interval unreadable, so the tolerance is unknown".toString(), settingFix, settingHint ?: null)
@@ -303,7 +355,8 @@ class ComplianceChecker {
         String observed = "${value}${from}: about ${seconds} s (${PATH_FAIL_SECONDS} s + ${n} x ${polling} s)".toString()
         seconds > ctx.toleranceWarnSeconds
                 ? result(Status.WARN, observed, settingFix, "Above the plugin's warning limit of ${ctx.toleranceWarnSeconds} s. HVM's own storage-loss clocks are shorter: all-paths-down at about 2 minutes, host offline at 140 s. Lower no_path_retry or polling_interval in a maintenance window. ${settingHint}".trim().toString())
-                : result(Status.PASS, observed, settingFix, settingHint ?: null)
+                // a differing setting is a WARN, not a PASS: only failing or warning checks carry their fix (see check)
+                : result(settingDiffers ? Status.WARN : Status.PASS, observed, settingFix, settingHint ?: null)
     }
 
     /**
@@ -358,6 +411,59 @@ class ComplianceChecker {
         }
         netplanFile ? "${window} Set mtu: 9000 on ${nic} and every interface under it (bond, uplinks, bridge) in ${netplanFile}, then sudo netplan apply. Then Rescan and Check again."
                 : "${window} Set MTU 9000 on ${nic} and every interface under it (bond, uplinks, bridge) wherever this host's network is defined."
+    }
+
+    /** FlashArray node records not logged in while their portal has a session through another iface: they only add a path at the next boot. */
+    static List<Map> spareNodes(HostFacts f) {
+        List<Map> live = f.pureSessions.findAll { it.state == 'LOGGED_IN' }
+        f.nodes.findAll { Map n ->
+            String p = n['node.conn[0].address']
+            String i = n['iface.iscsi_ifacename']
+            (n['node.name'] as String)?.contains('purestorage') && p && i &&
+                    !live.any { it.portal == p && it.iface == i } && live.any { it.portal == p && it.target == n['node.name'] }
+        }
+    }
+
+    /**
+     * iface records no discovery can use: bound to a NIC that is missing or has no IPv4 address, and with no session.
+     * Rebuilding an iSCSI virtual switch leaves the old switch's ifaces behind like this (bridge down, no address). A
+     * NIC that is only down (no carrier) but keeps its address is NOT dead: that is a fabric in maintenance or a link
+     * still coming up, and deleting its iface would leave the fabric without sessions at the next boot
+     * ({@link #downIfaces}). Judged only when the probe read link states.
+     */
+    static List<Map> deadIfaces(HostFacts f) {
+        if (!f.linkState) {
+            return []
+        }
+        Set<String> used = f.sessions*.iface as Set<String>
+        f.ifaces.findAll { Map i ->
+            String nd = i.netdev
+            nd && !(i.name in ['default', 'iser']) && !used.contains(i.name) && (!f.linkState.containsKey(nd) || !f.addrs[nd])
+        }
+    }
+
+    /** iface records without a session on a NIC that is down but still has its address: reported, never removed. */
+    static List<Map> downIfaces(HostFacts f) {
+        if (!f.linkState) {
+            return []
+        }
+        Set<String> used = f.sessions*.iface as Set<String>
+        f.ifaces.findAll { Map i ->
+            String nd = i.netdev
+            nd && !(i.name in ['default', 'iser']) && !used.contains(i.name) && f.linkState.containsKey(nd) &&
+                    !(f.linkState[nd] in ['up', 'unknown']) && f.addrs[nd]
+        }
+    }
+
+    /** iface records with no session and no node record left once the spare ones go, on a NIC another iface already serves. */
+    static List<Map> redundantIfaces(HostFacts f, List<Map> spare, List<Map> dead) {
+        Set<String> used = f.sessions*.iface as Set<String>
+        Set<String> deadNames = dead*.name as Set<String>
+        f.ifaces.findAll { Map i ->
+            i.netdev && !(i.name in ['default', 'iser']) && !used.contains(i.name) && !deadNames.contains(i.name) &&
+                    !f.nodes.any { Map n -> n['iface.iscsi_ifacename'] == i.name && !spare.any { it.is(n) } } &&
+                    f.ifaces.any { Map o -> o.name != i.name && o.netdev == i.netdev && used.contains(o.name) }
+        }
     }
 
     static List<Map> stalePools(HostFacts f) {

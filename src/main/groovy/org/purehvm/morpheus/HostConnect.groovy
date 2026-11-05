@@ -17,7 +17,7 @@ import groovy.util.logging.Slf4j
 @Slf4j
 class HostConnect {
     /** Fixes applied without asking when a host joins (or Add host runs): all automatic ones except removing pools. */
-    static final List<String> ON_JOIN = ['packages', 'iqn', 'services', 'multipath', 'udev', 'arp-sysctl', 'iscsi-sessions', 'node-startup']
+    static final List<String> ON_JOIN = ['packages', 'iqn', 'services', 'multipath', 'udev', 'arp-sysctl', 'stale-iscsi-records', 'iscsi-sessions', 'node-startup']
 
     /**
      * The cluster's Morpheus iSCSI targets as Morpheus applied them: the array portals the cluster's other hosts are
@@ -61,6 +61,15 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
         }
     }
 
+    /** True when {@code host} reaches at least one array portal directly, i.e. its iSCSI networking is up. */
+    static boolean storageReady(PureClusterContext ctx, String host, List<String> portals) {
+        if (!portals) {
+            return false
+        }
+        Map<String, HostRunner.Result> res = ctx.onAllHosts(routeScript(portals), [host])
+        portalReach(portals, res).any { (it.direct as List).contains(host) }
+    }
+
     /**
      * Probes {@code host} and applies {@code fixes} (null: every FAILING check whose fix is in {@link #ON_JOIN}).
      * Returns the titles of the steps applied; throws on the first failed step, naming what was already applied.
@@ -80,12 +89,16 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
         Collection<String> chosen = fixes
         if (chosen == null) {
             ComplianceChecker.Context cc = new ComplianceChecker.Context(portals, info.iqns as Set<String>, info.purity as String, retry,
-                    ComplianceMonitor.toleranceWarnSeconds(settings))
+                    ComplianceMonitor.toleranceWarnSeconds(settings), ComplianceMonitor.allowZero(settings))
             chosen = new ComplianceChecker().check(f, cc).findAll { it.status == ComplianceChecker.Status.FAIL && it.fix in ON_JOIN }*.fix.unique()
         }
         if (!chosen) {
             progress << "${host}: iSCSI and multipath already set up".toString()
             return []
+        }
+        String raw = (settings?.multipathNoPathRetry as String)?.trim()
+        if ('multipath' in chosen && raw && raw != retry) {
+            progress << "${host}: the Multipath no_path_retry setting '${raw}' is not 0 or 1-60, so it counts as 0".toString()
         }
         if ('iscsi-sessions' in chosen && f.hvmcli) {
             progress << (morpheusTargets == null
@@ -94,7 +107,7 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
         }
         String recordIqn = ctx.hosts.find { it.name == host }?.getiScsiInitiatorName()
         List<Map<String, String>> steps = new Remediation().scriptSteps(f, chosen, portals, info.purity as String, retry,
-                [iqn: recordIqn, targets: morpheusTargets])
+                [iqn: recordIqn, targets: morpheusTargets, allowZero: ComplianceMonitor.allowZero(settings)])
         List<String> applied = []
         steps.eachWithIndex { Map<String, String> s, int i ->
             progress << "${host}: [${i + 1}/${steps.size()}] ${s.title}...".toString()

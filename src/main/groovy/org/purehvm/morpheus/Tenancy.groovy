@@ -24,7 +24,11 @@ class Tenancy {
     }
 
     static boolean isOperator(User user, ComputeServerGroup cluster, Collection<Long> extraOperators = []) {
-        Account a = user?.account
-        a != null && (a.masterAccount == true || (cluster?.owner?.id != null && a.id == cluster.owner.id) || extraOperators.contains(a.id))
+        isOperatorTenant(user?.account, cluster, extraOperators)
+    }
+
+    /** The same rule for a tenant on its own (a workflow task carries its tenant, not a user). Unknown tenant: no. */
+    static boolean isOperatorTenant(Account a, ComputeServerGroup cluster, Collection<Long> extraOperators = []) {
+        a?.id != null && (a.masterAccount == true || (cluster?.owner?.id != null && a.id == cluster.owner.id) || extraOperators.contains(a.id))
     }
 }

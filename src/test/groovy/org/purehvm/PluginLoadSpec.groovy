@@ -30,7 +30,10 @@ class PluginLoadSpec extends Specification {
         plugin.controllers.size() == 1
         // controllers without a custom renderer are rejected by the 9.1.0.1 upload parser (verified on 9.1.0.1)
         plugin.hasCustomRender()
-        plugin.settings.size() == 14
+        plugin.settings.size() == 16
+        plugin.settings.find { it.fieldName == 'enableGuestFreeze' }.defaultValue == 'off'      // guests are never frozen unless turned on
+        plugin.settings.find { it.fieldName == 'multipathAllowZero' }.defaultValue == 'off'
+        plugin.providers*.code.contains('pure-flasharray-hvm.snapshotTask')
         plugin.settings.find { it.fieldName == 'multipathNoPathRetry' }.defaultValue == '0'
         plugin.settings.find { it.fieldName == 'multipathToleranceWarnSeconds' }.defaultValue == '110'
         plugin.settings.find { it.fieldName == 'tagNamespace' }.defaultValue == 'org.purehvm'

@@ -60,6 +60,14 @@ class HostGroupPlanner {
         List<String> warnings = []
         List<String> blockers = []
         List<String> strayHosts = []
+        /** The group named after the cluster, when another group (an old cluster's) already has that name. */
+        String nameTaken
+        /** What that group would be renamed to so this cluster can have the name: <name>-old. */
+        String renameTo
+        /** The plan renames nameTaken to renameTo before creating the cluster's group under the freed name. */
+        boolean renameExisting
+        /** The operator confirmed renaming a group that looks like an HVM cluster's (HostGroupApplier.hvmGroupEvidence). */
+        boolean hvmGroupConfirmed
 
         boolean isBlocked() { !blockers.isEmpty() }
 
@@ -75,7 +83,23 @@ class HostGroupPlanner {
         PureNames.sanitize(PureNames.shortHostname(node))
     }
 
-    Plan plan(String clusterName, List<Node> nodes, List<ArrayHost> arrayHosts, Collection<String> existingGroups, String preferredGroupName = null) {
+    /** "<name>-old", or "<name>-old-2", "-old-3"... when that is taken too (compared without case, as Purity does). */
+    static String oldName(String name, Collection<String> taken) {
+        Set<String> t = taken.collect { it.toLowerCase() } as Set<String>
+        String base = PureNames.sanitize("${name}-old".toString())
+        String n = base
+        for (int i = 2; t.contains(n.toLowerCase()); i++) {
+            n = PureNames.sanitize("${name}-old-${i}".toString())
+        }
+        n
+    }
+
+    /**
+     * @param renameTaken when the cluster's name is taken by another host group, rename that group to <name>-old and
+     *        create this cluster's group under the name (the operator chose it), instead of picking <name>-1
+     */
+    Plan plan(String clusterName, List<Node> nodes, List<ArrayHost> arrayHosts, Collection<String> existingGroups, String preferredGroupName = null,
+              boolean renameTaken = false) {
         Plan p = new Plan()
         if (!nodes) {
             p.blockers << 'The cluster has no hosts'
@@ -134,10 +158,21 @@ class HostGroupPlanner {
             p.hostGroup = groupVotes.max { it.value }.key
         } else {
             String want = PureNames.sanitize(preferredGroupName ?: clusterName)
-            p.hostGroup = PureNames.nonColliding(want, existingGroups)
+            String existing = existingGroups.find { it.equalsIgnoreCase(want) }
             p.createHostGroup = true
-            if (p.hostGroup != want) {
-                p.warnings << "Host group name ${want} is taken by another group; will create ${p.hostGroup}".toString()
+            if (existing) {
+                p.nameTaken = existing
+                p.renameTo = oldName(existing, existingGroups)
+            }
+            if (existing && renameTaken) {
+                p.hostGroup = want
+                p.renameExisting = true
+                p.warnings << "Host group ${existing} will be renamed to ${p.renameTo} (its hosts and volume connections stay as they are), then ${want} is created for this cluster".toString()
+            } else {
+                p.hostGroup = PureNames.nonColliding(want, existingGroups)
+                if (p.hostGroup != want) {
+                    p.warnings << "Host group name ${want} is taken by another group; will create ${p.hostGroup} (or rename the existing one to ${p.renameTo})".toString()
+                }
             }
         }
 
@@ -184,7 +219,8 @@ class HostGroupPlanner {
         }
 
         Set<String> planned = p.hosts*.arrayHost as Set<String>
-        p.strayHosts = arrayHosts.findAll { it.hostGroup == p.hostGroup && !planned.contains(it.name) }*.name.sort()
+        // after a rename the old group's hosts go with it: the new group starts empty
+        p.strayHosts = p.renameExisting ? [] : arrayHosts.findAll { it.hostGroup == p.hostGroup && !planned.contains(it.name) }*.name.sort()
         if (p.strayHosts) {
             p.warnings << "Host group ${p.hostGroup} also contains ${p.strayHosts.join(', ')}, which are not in this cluster (left untouched)".toString()
         }

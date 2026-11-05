@@ -77,4 +77,10 @@ class TenancySpec extends Specification {
         then:
         notThrown(Exception)
     }
+    def 'a workflow task without a known tenant is never an operator'() {
+        expect:
+        !Tenancy.isOperatorTenant(null, null)
+        !Tenancy.isOperatorTenant(new com.morpheusdata.model.Account(), null)
+        Tenancy.isOperatorTenant(new com.morpheusdata.model.Account(id: 1L, masterAccount: true), null)
+    }
 }

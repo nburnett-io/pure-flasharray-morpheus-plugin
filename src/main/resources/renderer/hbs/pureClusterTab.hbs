@@ -44,6 +44,10 @@
     <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="reclaim">Scan datastores</button>
       <span class="muted">Restore leftovers (.pre-restore disks, file-restore copies) no VM uses, other files that are not Morpheus disks, and Morpheus disks no VM holds.</span></div>
     <div class="ph-body"></div></section>
+  <section data-section="orphans"><h3>Leftover recovery clones</h3>
+    <div class="row"><button type="button" class="btn btn-default btn-sm" data-act="orphans">Look for leftovers</button>
+      <span class="muted">Read-only. Recovery clones on this cluster's arrays that no linked cluster owns (a deleted or unlinked cluster, a host that is gone), so no timeout ever closes them.</span></div>
+    <div class="ph-body"></div></section>
   <section data-section="retire"><h3>Retire datastore</h3><div class="ph-body muted">Retire... on a datastore above moves its VMs off with Morpheus Reconfigure, deletes it in Morpheus and removes the LUN from the hosts and the array.</div></section>
   <section data-section="jobs"><h3>Operations</h3><div class="ph-body"></div></section>
 </div>

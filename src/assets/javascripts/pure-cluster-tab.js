@@ -249,8 +249,16 @@
       call('snapshots', { volume: v.name, storageServerId: sid }).then(function (list) {
         var hosts = el('select', {}); (state.status.hosts || []).forEach(function (h) { hosts.appendChild(el('option', { value: h, text: h })); });
         var take = btn('Take snapshot now', function () {
-          var sfx = prompt('Optional suffix (letters, digits, -)') || '';
+          var sfx = prompt('Optional suffix (letters, digits, -)');
+          if (sfx === null) return;
           call('snapshot-create', { volume: v.name, suffix: sfx, storageServerId: sid }, true).then(function () { loadSnapshots(v); }).catch(function (e) { alert(e.message); });
+        });
+        var takeApp = btn('Take application-consistent snapshot', function () {
+          var sfx = prompt('Optional suffix (letters, digits, -)');
+          if (sfx === null) return;
+          if (confirm('Freeze the file systems of every running VM with a disk on ' + v.name + ' (qemu guest agent), take the snapshot, then thaw them?\n\n' +
+              'Guests are frozen for a few seconds. A VM without a guest agent is skipped and is crash-consistent in this snapshot. Each frozen guest is thawed by its host after 60 s whatever happens.'))
+            start('snapshot-create', { volume: v.name, suffix: sfx, storageServerId: sid, freeze: 'true' }, function () { loadSnapshots(v); });
         });
         var rows = list.map(function (sn) {
           var open = btn('Open (read-only)', function () {
@@ -263,7 +271,7 @@
           })) : null;
           return [sn.name, sn.created ? new Date(sn.created).toLocaleString() : '', sn.protectionGroup || '', actions([open, clone])];
         });
-        show('recovery', el('div', {}, [el('div', { 'class': 'row' }, [el('strong', { text: v.name + (state.status.links.length > 1 ? ' on ' + arrayName(sid) : '') }), ' Recovery host: ', hosts, take]),
+        show('recovery', el('div', {}, [el('div', { 'class': 'row' }, [el('strong', { text: v.name + (state.status.links.length > 1 ? ' on ' + arrayName(sid) : '') }), ' Recovery host: ', hosts, take].concat(state.status.guestFreeze ? [takeApp] : [])),
           rows.length ? table(['Snapshot', 'Created', 'Protection group', ''], rows) : el('div', { 'class': 'muted', text: 'No snapshots.' })]));
       }).catch(function (e) { err('recovery', e); });
     }
@@ -545,6 +553,20 @@
             line.appendChild(apply);
           }
           list.push(line);
+          // the cluster's name is taken by another (old) host group: offer to rename that one to <name>-old
+          if (a.nameTaken && a.hostGroup !== a.nameTaken && !a.nameTakenBy && adm(true)) {
+            var rename = btn('Rename ' + a.nameTaken + ' to ' + a.renameTo + ' and use ' + a.nameTaken, function () {
+              var warnHvm = a.nameTakenEvidence ? '\n\nWARNING: it looks like an HVM cluster\'s group (' + a.nameTakenEvidence + '). Only rename it if that cluster is retired: ' +
+                  'a cluster still using it, on this or another Morpheus, would add its next host to the new group.' : '';
+              if (confirm('On ' + arrayName(a.storageServerId) + ': rename the existing host group ' + a.nameTaken + ' to ' + a.renameTo +
+                  ' (its hosts and volume connections stay as they are), then create ' + a.nameTaken + ' for this cluster and add every cluster host to it?' + warnHvm))
+                start('hostgroup-apply', { storageServerId: a.storageServerId, hostGroup: a.nameTaken, renameExisting: 'true', confirmHvmGroup: a.nameTakenEvidence ? 'true' : '' }, function () { loadStatus(); loadHosts(); });
+            });
+            rename.disabled = (a.blockers || []).length > 0;
+            list.push(el('div', { 'class': 'row' }, [el('span', { 'class': 'muted', text: 'Host group ' + a.nameTaken + ' already exists on the array and is not this cluster\'s. ' }), rename]));
+          } else if (a.nameTaken && a.nameTakenBy) {
+            list.push(el('div', { 'class': 'muted', text: 'Host group ' + a.nameTaken + ' belongs to cluster ' + a.nameTakenBy + ', so it cannot be renamed from here.' }));
+          }
           (a.blockers || []).forEach(function (b) { list.push(el('div', { 'class': 'err', text: b })); });
           if ((a.strayHosts || []).length) list.push(el('div', { 'class': 'st-WARN', text: 'In ' + a.hostGroup + ' but not in this cluster (left untouched): ' + a.strayHosts.join(', ') }));
         });
@@ -682,7 +704,27 @@
       return wrap;
     }
 
+    /** Recovery clones no linked cluster owns; removable ones get a Remove button (destroyed, not eradicated). */
+    function loadOrphans() {
+      show('orphans', el('div', { 'class': 'muted', text: 'Reading recovery clones on every linked array...' }));
+      call('recovery-orphans').then(function (d) {
+        if (!d.orphans.length) { show('orphans', el('div', { 'class': 'muted', text: 'None: every recovery clone belongs to a linked cluster, whose timeout closes it.' })); return; }
+        show('orphans', table(['Array', 'Volume', 'Snapshot', 'Host', 'Created', ''], d.orphans.map(function (o) {
+          var act = o.removable ? adm(btn('Remove', function () {
+            if (confirm('Remove leftover recovery clone ' + o.volume + ' on ' + o.array + '?' + (o.host ? '\n\nIt is unmounted and its device removed on ' + o.host + ' first.' : '') +
+                '\n\nThe volume is destroyed, not eradicated: it stays in the array\'s destroyed bucket until the array eradicates it.'))
+              start('recovery-orphan-remove', { storageServerId: o.storageServerId, volume: o.volume }, loadOrphans);
+          }, 'btn-warning')) : el('span', { 'class': 'st-WARN', text: o.reason });
+          return [o.array, o.volume, o.snapshot || '?', o.host || (o.connectedHosts || []).join(', ') || '-', hhmm(o.created), act || ''];
+        })));
+      }).catch(function (e) { err('orphans', e); });
+    }
+
     function onAction(act) {
+      if (act === 'orphans') {
+        loadOrphans();
+        return;
+      }
       if (act === 'policies') {
         loadPolicies();
       } else if (act === 'reclaim') {

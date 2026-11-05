@@ -77,8 +77,10 @@ class PureStorageProvider extends AbstractStorageProvider implements PluginProvi
                 return   // cluster not linked to a FlashArray
             }
             if (ce.type == ClusterEvent.ClusterEventType.REMOVE_WORKER) {
-                log.info("Pure plugin: ${host} left ${ctx.cluster.name}; its array host stays in host group(s) " +
-                        "${ctx.links*.hostGroup.findAll().join(', ')} until removed on the array")
+                // deliberately not removed automatically: the host may still have GFS2 mounted, and pulling its LUNs
+                // would withdraw the filesystem there. The Hosts section lists it as a stray host of the group.
+                Audit.info(morpheus, null, ctx.cluster, 'host left the cluster: its array host stays in the FlashArray host group until removed there (Hosts section lists it)',
+                        [host: host, hostGroups: ctx.links*.hostGroup.findAll().join(', ')])
                 return
             }
             Map settings = PureFlashArrayPlugin.readSettings(morpheus, plugin)
@@ -87,12 +89,71 @@ class PureStorageProvider extends AbstractStorageProvider implements PluginProvi
                 return
             }
             Audit.info(morpheus, null, ctx.cluster, 'host joined the cluster: setting up its iSCSI and adding it to the FlashArray host group(s)', [host: host])
-            Jobs.start('auto-add-host', clusterId, 'morpheus (host added)') { List<String> progress ->
-                [host: host, storage: new HostOnboarding(morpheus, ctx, progress, settings).add(host)]   // every linked array
+            whenStorageReady(ctx, host, 1) {
+                Jobs.start('auto-add-host', clusterId, 'morpheus (host added)') { List<String> progress ->
+                    [host: host, storage: new HostOnboarding(morpheus, ctx, progress, settings).add(host)]   // every linked array
+                }
             }
         } catch (Exception e) {
             log.warn("Pure plugin: auto-add of ${host} to cluster ${clusterId} not started: ${e.message}")
         }
+    }
+
+    static final int JOIN_CHECKS = 6
+    static final long JOIN_CHECK_MINUTES = 2
+    private static final java.util.concurrent.ScheduledExecutorService JOIN_TIMER = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { Runnable r ->
+        Thread t = new Thread(r, 'pure-hvm-join-wait')
+        t.daemon = true
+        t
+    }
+
+    /**
+     * Morpheus builds a joining host's iSCSI virtual switch while (or after) it reports ADD_WORKER. Until a storage NIC is
+     * up the sessions step can only skip every portal, so wait for one: check now and every JOIN_CHECK_MINUTES, then
+     * start the add anyway after JOIN_CHECKS tries (its log then says why nothing connected). Waiting happens on a
+     * timer, not in a job, so the cluster's other jobs are not held up.
+     */
+    static final int JOIN_BUSY_RETRIES = 15
+
+    private void whenStorageReady(PureClusterContext ctx, String host, int attempt, Closure start, int busyTries = 0) {
+        boolean ready
+        try {
+            ready = HostConnect.storageReady(ctx, host, ComplianceMonitor.arrayFacts(ctx).portals as List<String>)
+        } catch (Exception e) {
+            log.info("Pure plugin: ${host}: storage readiness unknown (${e.message}); adding it now")
+            ready = true
+        }
+        if (ready || attempt >= JOIN_CHECKS) {
+            if (!ready) {
+                log.warn("Pure plugin: ${host} still reaches no array portal after ${(JOIN_CHECKS - 1) * JOIN_CHECK_MINUTES} min; adding it anyway")
+            }
+            try {
+                start.call()
+            } catch (IllegalStateException busy) {
+                // another operation holds the cluster (several hosts joining at once): try again, then give up loudly
+                if (busyTries >= JOIN_BUSY_RETRIES) {
+                    log.warn("Pure plugin: ${host} not added automatically: the cluster stayed busy (${busy.message})")
+                    Audit.info(morpheus, null, ctx.cluster, 'host joined but was NOT added to the FlashArray automatically (cluster busy): use Add in the Hosts section', [host: host])
+                    return
+                }
+                log.info("Pure plugin: ${host}: cluster busy (${busy.message}); adding it in ${JOIN_CHECK_MINUTES} min (${busyTries + 1}/${JOIN_BUSY_RETRIES})")
+                later { whenStorageReady(ctx, host, attempt, start, busyTries + 1) }
+            }
+            return
+        }
+        log.info("Pure plugin: ${host} reaches no array portal yet (iSCSI virtual switch not up?); checking again in ${JOIN_CHECK_MINUTES} min (${attempt}/${JOIN_CHECKS})")
+        later { whenStorageReady(ctx, host, attempt + 1, start, busyTries) }
+    }
+
+    /** Runs on the join timer after JOIN_CHECK_MINUTES; an exception there would otherwise vanish without a log line. */
+    private void later(Closure c) {
+        JOIN_TIMER.schedule({
+            try {
+                c.call()
+            } catch (Throwable e) {
+                log.warn("Pure plugin: join wait failed: ${e.message}", e)
+            }
+        } as Runnable, JOIN_CHECK_MINUTES, java.util.concurrent.TimeUnit.MINUTES)
     }
 
     @Override

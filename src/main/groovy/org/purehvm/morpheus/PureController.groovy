@@ -101,6 +101,7 @@ class PureController implements PluginController {
                 Route.build('/pure-hvm/retire-plan', 'retirePlan', read),
                 Route.build('/pure-hvm/datastore-tenants', 'datastoreTenants', read),
                 Route.build('/pure-hvm/reclaim-scan', 'reclaimScan', read),
+                Route.build('/pure-hvm/recovery-orphans', 'recoveryOrphans', read),
                 // snapshot recovery (Operations: full)
                 Route.build('/pure-hvm/snapshot-create', 'snapshotCreate', full),
                 Route.build('/pure-hvm/recovery-open', 'recoveryOpen', full),
@@ -127,6 +128,7 @@ class PureController implements PluginController {
                 Route.build('/pure-hvm/retire-morpheus', 'retireMorpheus', admin),
                 Route.build('/pure-hvm/datastore-share', 'datastoreShare', admin),
                 Route.build('/pure-hvm/reclaim-delete', 'reclaimDelete', admin),
+                Route.build('/pure-hvm/recovery-orphan-remove', 'recoveryOrphanRemove', admin),
         ]
     }
 
@@ -361,7 +363,7 @@ class PureController implements PluginController {
                 out
             }
             ok([cluster: [id: ctx.cluster.id, name: ctx.cluster.name], hosts: ctx.hostNames, linked: !links.isEmpty(), links: links,
-                experimental: experimental(), canAdmin: canAdmin(m.user), jobs: Jobs.forCluster(ctx.cluster.id).take(10)*.toMap(),
+                experimental: experimental(), guestFreeze: ConsistentSnapshot.enabled(settings()), canAdmin: canAdmin(m.user), jobs: JobHistory.merged(Jobs.forCluster(ctx.cluster.id), ctx.cluster, 10),
                 compliance: (ComplianceMonitor.LAST[ctx.cluster.id] ?: [:]) + [everyHours: ComplianceMonitor.intervalHours(settings())],
                 existing: scans ? Adoption.merge(scans).findAll { it.state != 'adopted' } : [],
                 recoveries: RecoverySessions.refresh(ctx, hours).collect { sessionView(it) }, recoveryTimeoutHours: hours])
@@ -433,7 +435,10 @@ class PureController implements PluginController {
                         new HostGroupApplier(fa).plan(ctx.cluster.name, nodes, l.hostGroup as String)
                     }
                     plans[sid] = plan
-                    a += [hostGroup: plan.hostGroup, blockers: plan.blockers, strayHosts: plan.strayHosts]
+                    a += [hostGroup: plan.hostGroup, blockers: plan.blockers, strayHosts: plan.strayHosts,
+                          nameTaken: plan.nameTaken, renameTo: plan.renameTo,
+                          nameTakenBy: plan.nameTaken ? ctx.clusterUsing(sid, plan.nameTaken) : null,
+                          nameTakenEvidence: plan.nameTaken ? ctx.withArray(sid) { FlashArrayClient fa -> new HostGroupApplier(fa).hvmGroupEvidence(plan.nameTaken) } : null]
                 } catch (Exception e) {
                     a.error = e.message
                 }
@@ -573,7 +578,20 @@ class PureController implements PluginController {
                 List<Map> iqns = ctx.iqnReport
                 syncIqns(ctx, progress, iqns)
                 List<HostGroupPlanner.Node> nodes = PureClusterContext.nodesOf(iqns)
-                HostGroupPlanner.Plan plan = ap.plan(ctx.cluster.name, nodes, (p(m).hostGroup as String) ?: link.hostGroup as String)
+                boolean rename = flag(p(m).renameExisting)
+                HostGroupPlanner.Plan plan = ap.plan(ctx.cluster.name, nodes, (p(m).hostGroup as String) ?: link.hostGroup as String, rename)
+                if (rename && !plan.renameExisting) {
+                    throw new IllegalStateException('Nothing to rename: the host group name is not taken by another group (re-open the Hosts section)')
+                }
+                if (plan.renameExisting) {
+                    // never rename a group a cluster (this one included) is linked to: its link records the name
+                    String user = (link.hostGroup as String)?.equalsIgnoreCase(plan.nameTaken) ? ctx.cluster.name
+                            : ctx.clusterUsing(link.storageServerId as Long, plan.nameTaken)
+                    if (user) {
+                        throw new IllegalStateException("Host group ${plan.nameTaken} is linked to cluster ${user}; refusing to rename it")
+                    }
+                    plan.hvmGroupConfirmed = flag(p(m).confirmHvmGroup)
+                }
                 String other = ctx.clusterUsing(link.storageServerId as Long, plan.hostGroup)
                 if (other) {
                     throw new IllegalStateException("Host group ${plan.hostGroup} is already linked to cluster ${other}; refusing to change it")
@@ -686,6 +704,18 @@ class PureController implements PluginController {
 
     def snapshotCreate(ViewModel<Map> m) {
         guarded {
+            if (flag(p(m).freeze)) {
+                ConsistentSnapshot.requireEnabled(settings())
+                // application-consistent: freeze the guests on every host, snapshot, thaw (a job: it calls every host)
+                String v = p(m).volume as String
+                String sfx = (p(m).suffix as String) ?: null
+                return startArrayJob(m, 'snapshot-consistent') { PureClusterContext ctx, Map link, FlashArrayClient fa, List<String> progress ->
+                    requireClusterVolume(fa, ctx, v)
+                    Map r = new ConsistentSnapshot(ctx, progress).take(fa, v, sfx)
+                    audit(m, ctx, 'took application-consistent array snapshot', [volume: v, snapshot: r.snapshot, frozen: r.frozen, skipped: (r.skipped as List).size()])
+                    r
+                }
+            }
             PureClusterContext ctx = operatorCtx(m)
             String vol = p(m).volume as String
             Map r = ctx.withArray(linkFor(ctx, m).storageServerId as Long) { FlashArrayClient fa ->
@@ -1250,6 +1280,29 @@ class PureController implements PluginController {
             List<String> paths = (p(m).paths instanceof List ? p(m).paths : (p(m).paths as String)?.tokenize(',')) as List<String>
             startJob(m, 'reclaim') { PureClusterContext ctx, List<String> progress ->
                 new Reclaim(morpheus, ctx, progress).delete(dsId, (paths ?: [])*.trim().findAll() as List<String>)
+            }
+        }
+    }
+
+    /** Read-only: recovery clones on this cluster's arrays that no linked cluster owns (no sweeper closes them). */
+    def recoveryOrphans(ViewModel<Map> m) {
+        guarded {
+            ok([orphans: RecoverySessions.orphans(morpheus, operatorCtx(m))])
+        }
+    }
+
+    /** Removes one leftover recovery clone (storageServerId, volume) as a cluster job; destroyed, not eradicated. */
+    def recoveryOrphanRemove(ViewModel<Map> m) {
+        guarded {
+            Long sid = requiredLong(m, 'storageServerId')
+            String volume = p(m).volume as String
+            if (!volume) {
+                throw new IllegalArgumentException('volume is required')
+            }
+            startJob(m, 'recovery-orphan') { PureClusterContext ctx, List<String> progress ->
+                RecoverySessions.removeOrphan(morpheus, ctx, sid, volume, progress)
+                audit(m, ctx, 'removed a leftover recovery clone', [volume: volume, storageServerId: sid])
+                [volume: volume]
             }
         }
     }

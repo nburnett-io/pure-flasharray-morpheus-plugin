@@ -96,6 +96,11 @@ class RecoverySessions {
                     }
                     entry.created = tags.created?.isLong() ? tags.created as Long : null
                     entry.expires = expiresAt(tags, timeoutHours)
+                    if (entry.expires == null) {
+                        // a clone with neither "expires" nor "created" would never time out: give it one timeout from now
+                        entry.expires = extend(fa, entry, timeoutHours)
+                        log.info("recovery session ${tag} (${v.name}) had no expiry; closes at ${new Date(entry.expires as Long).toInstant()}")
+                    }
                     out << entry
                 }
             } finally {
@@ -118,6 +123,80 @@ class RecoverySessions {
             }
         }
         s
+    }
+
+    // ------------------------------------------------------------------ leftovers no cluster owns
+
+    /**
+     * Recovery clones on this cluster's arrays that no linked cluster owns, so no sweeper will ever close them: tagged
+     * for a cluster that was deleted or unlinked from that array, or (older clones) mounted on a host no linked cluster
+     * has. [storageServerId, array, volume, source, snapshot, host, created, connectedHosts, removable, reason].
+     */
+    static List<Map> orphans(MorpheusContext morpheus, PureClusterContext ctx) {
+        List<Map> out = []
+        ctx.links.each { Map l ->
+            Long sid = l.storageServerId as Long
+            // every cluster linked to this array, with its hosts: the possible owners of a clone on it
+            List<Map> owners = morpheus.services.cluster.list(new DataQuery())
+                    .findAll { ComputeServerGroup c -> PureClusterContext.linksOf(c).any { it.storageServerId == sid } }
+                    .collect { ComputeServerGroup c -> [id: c.id, hosts: c.id == ctx.cluster.id ? ctx.hostNames : new PureClusterContext(morpheus, c.id).hostNames] }
+            ctx.withArray(sid) { FlashArrayClient fa ->
+                Map<String, Map<String, String>> byVol = fa.tagsByVolume()
+                List<String> clones = byVol.findAll { k, v -> v.role == ROLE }*.key
+                if (!clones) {
+                    return
+                }
+                fa.listVolumes([destroyed: false]).findAll { clones.contains(it.name) }.each { Map v ->
+                    Map<String, String> tags = byVol[v.name as String]
+                    if (owners.any { Map o -> belongsTo(tags, o.id as Long, o.hosts as List<String>) }) {
+                        return
+                    }
+                    List<String> connected = fa.listConnections([volume_names: v.name]).findAll { it.host && !it.hostGroup }*.host.unique() as List<String>
+                    boolean hereHost = tags.host && ctx.hostNames.contains(tags.host)
+                    String reason = hereHost ? null : (connected ? "connected to array host(s) ${connected.join(', ')}, which this cluster cannot clean up: disconnect on the array first" : null)
+                    out << [storageServerId: sid, array: ctx.storageServer(sid).name, volume: v.name, source: tags.source, snapshot: tags.snapshot,
+                            host: tags.host, created: tags.created?.isLong() ? tags.created as Long : null, clusterId: tags['recovery-cluster-id'],
+                            connectedHosts: connected, removable: reason == null, reason: reason]
+                }
+            }
+        }
+        out
+    }
+
+    /**
+     * Removes one leftover clone found by {@link #orphans}: unmounted and disconnected through its host when that host is
+     * in this cluster, otherwise only when nothing is connected to it. Destroyed, not eradicated: it stays in the
+     * array's destroyed bucket until the array eradicates it.
+     */
+    static void removeOrphan(MorpheusContext morpheus, PureClusterContext ctx, Long storageServerId, String volume, List<String> progress) {
+        Map o = orphans(morpheus, ctx).find { it.storageServerId == storageServerId && it.volume == volume }
+        if (!o) {
+            throw new IllegalArgumentException("${volume} is not a leftover recovery clone of this cluster's arrays (anymore)")
+        }
+        if (!o.removable) {
+            throw new IllegalStateException("${volume}: ${o.reason}")
+        }
+        ctx.withArray(storageServerId) { FlashArrayClient fa ->
+            if (o.host && ctx.hostNames.contains(o.host)) {
+                Map v = fa.getVolume(volume)
+                RecoveryOps.Session s = new RecoveryOps.Session(tag: tagOf(volume, [:]), volume: volume, serial: v?.serial, wwid: PureNames.wwid(v?.serial as String),
+                        host: o.host, arrayHost: (o.connectedHosts as List<String>)?.find())
+                s.mount = ctx.runner.run(s.host, HostScripts.findMount(s.wwid)).kv.MOUNT ?: null
+                progress << "${volume}: cleaning up on ${s.host}${s.mount ? ' (mounted at ' + s.mount + ')' : ''}".toString()
+                if (s.arrayHost) {
+                    new RecoveryOps(fa, ctx.runner, progress).closeRecovery(s, false)
+                } else {
+                    HostRunner.Result r = ctx.runner.run(s.host, HostScripts.hostCleanup(s.wwid, s.mount))
+                    if (!r.ok) {
+                        throw new IllegalStateException("Host ${s.host} not clean (${r.error}); ${volume} left in place")
+                    }
+                    fa.destroyVolume(volume)
+                }
+            } else {
+                fa.destroyVolume(volume)
+            }
+            progress << "${volume} destroyed (kept in the array's destroyed bucket until eradicated there)".toString()
+        }
     }
 
     /** Pushes a session's expiry out by one timeout from now ("Keep open"). */
@@ -163,15 +242,24 @@ class RecoverySessions {
         long hours = timeoutHours(settings)
         long now = System.currentTimeMillis()
         morpheus.services.cluster.list(new DataQuery()).findAll { ComputeServerGroup c -> PureClusterContext.linksOf(c) }.each { ComputeServerGroup c ->
-            PureClusterContext ctx = new PureClusterContext(morpheus, c.id)
-            closeExpired(morpheus, ctx, c, refresh(ctx, hours).findAll { it.expires && it.expires < now })
-            FileRestoreCopies.sweep(morpheus, ctx, settings)
+            // one cluster's failure (an array answering 503 during an upgrade) must not skip every cluster after it
             try {
-                SnapshotIndex.indexPending(morpheus, ctx)
+                PureClusterContext ctx = new PureClusterContext(morpheus, c.id)
+                try {
+                    closeExpired(morpheus, ctx, c, refresh(ctx, hours).findAll { it.expires && it.expires < now })
+                } catch (Exception e) {
+                    log.warn("recovery sweep of ${c.name} failed: ${e.message}", e)
+                }
+                FileRestoreCopies.sweep(morpheus, ctx, settings)
+                try {
+                    SnapshotIndex.indexPending(morpheus, ctx)
+                } catch (Exception e) {
+                    log.warn("snapshot index pass on ${c.name} failed: ${e.message}", e)
+                }
+                ComplianceMonitor.runIfDue(morpheus, ctx, settings, now)
             } catch (Exception e) {
-                log.warn("snapshot index pass on ${c.name} failed: ${e.message}", e)
+                log.warn("sweeper pass on ${c.name} failed: ${e.message}", e)
             }
-            ComplianceMonitor.runIfDue(morpheus, ctx, settings, now)
         }
     }
 

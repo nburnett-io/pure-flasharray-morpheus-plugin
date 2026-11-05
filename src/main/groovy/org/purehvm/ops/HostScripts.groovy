@@ -120,6 +120,57 @@ echo "MOUNT=\$(mnt_of \$W)"
 """
     }
 
+    // ------------------------------------------------------------------ application-consistent snapshots
+
+    /** Longest a guest stays frozen if the plugin never thaws it: a host timer thaws it regardless. */
+    static final int FREEZE_SAFETY_SEC = 60
+
+    /**
+     * Freezes the guest filesystems (qemu guest agent, `virsh domfsfreeze`) of every RUNNING domain on this host with a
+     * disk under {@code mountPoint}. Before each freeze a transient systemd timer is armed that thaws that domain after
+     * FREEZE_SAFETY_SEC whatever happens to the plugin. Never touches the host's own GFS2 filesystem (a host-level freeze
+     * is cluster-wide and stalls Morpheus's heartbeats). FROZEN=<domain>, SKIPPED=<domain>|<reason> (no agent, timeout).
+     */
+    static String guestFreeze(String mountPoint, String tag) {
+        requireSafePath(mountPoint)
+        if (!(tag ==~ /[a-z0-9]{1,20}/)) {
+            throw new IllegalArgumentException("Unsafe tag: ${tag}")
+        }
+        HEADER + """MP='${mountPoint}'; TAG='${tag}'
+for d in \$(virsh list --name 2>/dev/null); do
+  virsh domblklist "\$d" --details 2>/dev/null | awk -v mp="\$MP/" '\$1=="file" && index(\$4, mp)==1 {f=1} END {exit !f}' || continue
+  u="pure-thaw-\$TAG-\$(printf %s "\$d" | tr -c 'A-Za-z0-9' '-' | cut -c1-60)"
+  systemd-run --quiet --unit "\$u" --on-active=${FREEZE_SAFETY_SEC} virsh domfsthaw "\$d" </dev/null >/dev/null 2>&1 || { echo "SKIPPED=\$d|no safety timer, not frozen"; continue; }
+  if out=\$(timeout 15 virsh domfsfreeze "\$d" </dev/null 2>&1); then
+    echo "FROZEN=\$d"
+  else
+    # a timeout kills only the client: the agent may still finish the freeze. Thaw now and KEEP the timer as backstop.
+    timeout 30 virsh domfsthaw "\$d" </dev/null >/dev/null 2>&1 || true
+    echo "SKIPPED=\$d|\$(echo "\$out" | tr '\\n|' '  ' | cut -c1-160)"
+  fi
+done
+echo "DONE=1"
+"""
+    }
+
+    /** Thaws the given domains (FROZEN lines of {@link #guestFreeze}) and stops their safety timers. THAWED / THAW_FAILED. */
+    static String guestThaw(List<String> domains, String tag) {
+        domains.each { requireDomain(it) }
+        if (!(tag ==~ /[a-z0-9]{1,20}/)) {
+            throw new IllegalArgumentException("Unsafe tag: ${tag}")
+        }
+        HEADER + domains.collect { String d ->
+            // the safety timer is stopped only after a thaw that worked: on THAW_FAILED it is the guest's way out
+            """if timeout 30 virsh domfsthaw '${d}' </dev/null >/dev/null 2>&1; then
+  echo 'THAWED=${d}'
+  systemctl stop "pure-thaw-${tag}-\$(printf %s '${d}' | tr -c 'A-Za-z0-9' '-' | cut -c1-60).timer" >/dev/null 2>&1 || true
+else
+  echo 'THAW_FAILED=${d}'
+fi
+"""
+        }.join('') + 'echo "DONE=1"\n'
+    }
+
     /** gfs2_grow runs on ONE host, on the mount point (never the raw device). */
     static String gfs2Grow(String mountPoint) {
         requireSafePath(mountPoint)

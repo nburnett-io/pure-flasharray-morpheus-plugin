@@ -8,8 +8,9 @@ import java.util.concurrent.Executors
 
 /**
  * Long-running operations (provision, grow, recovery) run off the HTTP request thread; the tab polls
- * /job?id=. One mutating job per cluster at a time. State is in memory: an appliance restart mid-job
- * loses the progress view (not the array/host state, which every operation re-reads).
+ * /job?id=. One mutating job per cluster at a time. Running jobs are in memory; a finished job is also kept in the
+ * cluster's config by {@link JobHistory} (through {@link #onFinish}), so the list survives a restart. A restart
+ * mid-job still loses that job's progress view (not the array/host state, which every operation re-reads).
  */
 @Slf4j
 class Jobs {
@@ -36,6 +37,8 @@ class Jobs {
     private static final Map<Long, String> RUNNING = new ConcurrentHashMap<>()
     private static final ExecutorService POOL = Executors.newCachedThreadPool()
     static final long KEEP_MS = 24L * 3600 * 1000
+    /** Called with each finished job (set by the plugin: JobHistory.record). */
+    static volatile Closure onFinish
 
     /** @param work receives the job's progress list and returns the result */
     static Job start(String kind, Long clusterId, String user, Closure work) {
@@ -61,6 +64,11 @@ class Jobs {
             } finally {
                 j.ended = System.currentTimeMillis()
                 RUNNING.remove(clusterId, j.id)
+                try {
+                    onFinish?.call(j)
+                } catch (Throwable t) {
+                    log.warn("job ${kind}: finish hook failed: ${t.message}")
+                }
             }
         }
         j

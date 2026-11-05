@@ -149,5 +149,10 @@ Tested on: Morpheus 9.1, an HVM cluster of two hosts on Ubuntu 24.04/26.04, one 
 | Recovery session, restore disk, restore VM in place | yes | yes (orchestration) | yes (a test VM) |
 | Clone as datastore | yes (experimental) | script content | no |
 | Hosts table, add to host group, mount on a new host, ADD_WORKER | yes | script content | table yes; adding a host, no (waiting on a new host) |
+| Unused/dead iSCSI records (ISC-07), node records in use only, duplicate sessions (ISC-03c) (0.13.5) | yes | yes | checks on a test cluster (found a host with two sessions per portal); the cleanup kept records that were in use when it ran; deleting a dead iface on a real host, no |
+| Rename a taken host-group name to `<name>-old` (0.13.5) | yes | planner yes | no (needs a cluster whose name another group holds) |
+| Leftover recovery clones, persistent job history (0.13.5) | yes | partly | listing (none found) and history surviving a plugin reinstall, yes; removing a leftover, no |
+| Application-consistent snapshots (0.13.5, off by default) | yes | script content | refused while off, yes; freezing live guests, no |
+| Workflow task "Pure FlashArray snapshot" (0.13.5) | yes | option reading | yes: registered, ran against a test VM and took the snapshot |
 | Several arrays per cluster, several clusters per array | yes | links, legacy migration, resolve, guard, adoption merge | single-link migration and tab, yes; a second array, no (tested with one) |
 | Morpheus wiring (storage server, tab, controller) | yes | API contract against plugin-api 1.5.0 | yes |

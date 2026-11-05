@@ -18,6 +18,7 @@ class HostFacts {
     Map<String, String> mpPure = [:]         // effective PURE device stanza
     Map<String, String> mpDefaults = [:]     // defaults section: polling_interval, no_path_retry
     Map<String, String> mpOverrides = [:]    // overrides section: no_path_retry
+    Map<String, String> mpEntries = [:]      // multipaths{} entries: wwid -> no_path_retry (beats every other section for that map)
     List<Map> maps = []                      // [wwid, name, queueing, paths]
     List<Map> paths = []                     // [wwid, dev, dmState, checker, prio, vendor]
     List<Map> queues = []                    // [dev, scheduler, addRandom, rqAffinity, maxSectorsKb, timeout]
@@ -33,6 +34,7 @@ class HostFacts {
     Map<String, String> gfs2Tables = [:]     // device -> lock table
     List<Map> pools = []                     // libvirt storage pools [name, target, state]
     boolean hvmcli
+    Map<String, String> linkState = [:]      // interface -> operstate (empty: probe older than 0.13.2)
     boolean complete                         // saw the @@end marker
 
     static HostFacts parse(String output) {
@@ -70,6 +72,12 @@ class HostFacts {
                 sess = [target: target, portal: l.substring(15).trim().split(',')[0].replaceFirst(/:\d+$/, '')]
                 f.sessions << sess
             } else if (sess != null && l.startsWith('Iface Name:')) {
+                // -P1 lists every session to one portal under a single "Current Portal" heading, one interface block
+                // each: a second Iface Name is a second session
+                if (sess.iface != null) {
+                    sess = [target: sess.target, portal: sess.portal]
+                    f.sessions << sess
+                }
                 sess.iface = l.substring(11).trim()
             } else if (sess != null && l.startsWith('Iface Netdev:')) {
                 // unbound sessions print "<empty>" on older open-iscsi and the literal "default" on Ubuntu 24.04+
@@ -80,9 +88,14 @@ class HostFacts {
             }
         }
 
+        // a record also ends where the next one begins (and at the end of the section): probes before 0.13.5 filtered
+        // out the "# END RECORD" lines, so on real hosts no record was ever read
         Map rec = null
         sections.nodes?.each { String l ->
             if (l.startsWith('# BEGIN RECORD')) {
+                if (rec) {
+                    f.nodes << rec
+                }
                 rec = [:]
             } else if (l.startsWith('# END RECORD')) {
                 if (rec) {
@@ -93,6 +106,9 @@ class HostFacts {
                 int i = l.indexOf(' = ')
                 rec[l.substring(0, i).trim()] = clean(l.substring(i + 3).trim())
             }
+        }
+        if (rec) {
+            f.nodes << rec
         }
 
         boolean inDevice = false
@@ -109,6 +125,7 @@ class HostFacts {
         }
 
         split(sections.mpglobal).each { List<String> p -> (p[0] == 'overrides' ? f.mpOverrides : f.mpDefaults)[p[1]] = p[2] }
+        split(sections.mpentries).each { List<String> p -> if (p[0] && p.size() > 1) { f.mpEntries[p[0]] = p[1] } }
 
         split(sections.maps).each { List<String> p -> f.maps << [wwid: p[0], name: p[1], queueing: p[2], paths: (p[3] ?: '0').trim()] }
         split(sections.paths).each { List<String> p -> f.paths << [wwid: p[0], dev: p[1], dmState: p[2], checker: p[3], prio: p[4], vendor: p[5]] }
@@ -137,6 +154,7 @@ class HostFacts {
         split(sections.gfs2tables).each { List<String> p -> f.gfs2Tables[p[0]] = p[1] }
         split(sections.pools).each { List<String> p -> if (p[0]) { f.pools << [name: p[0], target: p.size() > 1 ? p[1] : null, state: p.size() > 2 ? p[2] : null] } }
         f.hvmcli = sections.hvmcli?.any { it.trim() } ?: false
+        split(sections.linkstate).each { List<String> p -> if (p[0]) { f.linkState[p[0]] = p.size() > 1 ? p[1] : '' } }
         // Sessions on the "default" iface carry no netdev: the kernel routes them, so the route is the NIC.
         f.sessions.each { Map s -> s.viaNic = s.netdev ?: f.routes[s.portal as String] }
         f

@@ -64,4 +64,46 @@ class HostScriptsSpec extends Specification {
                     s.indexOf('-o open $SW') < s.indexOf('multipath -f $SW')
         }
     }
+    def 'guest freeze: only running VMs with a disk on the datastore, a safety thaw timer before each freeze, never the host filesystem'() {
+        when:
+        def s = HostScripts.guestFreeze(MP, 'abc123')
+
+        then:
+        s.contains('virsh list --name')                                  // running domains only
+        s.contains('index($4, mp)==1')                                    // a disk under this datastore
+        s.indexOf('systemd-run') < s.indexOf('virsh domfsfreeze')
+        s.contains("--on-active=${HostScripts.FREEZE_SAFETY_SEC} virsh domfsthaw")
+        s.contains('timeout 15 virsh domfsfreeze')
+        !s.contains('fsfreeze -f') && !s.contains('gfs2_freeze')       // the host GFS2 is never frozen
+    }
+
+    def 'guest thaw stops the safety timers; unsafe names and tags are refused'() {
+        expect:
+        HostScripts.guestThaw(['vm-1', 'vm.2'], 'abc123').contains("virsh domfsthaw 'vm-1'")
+        HostScripts.guestThaw(['vm-1'], 'abc123').contains('systemctl stop "pure-thaw-abc123-')
+
+        when:
+        HostScripts.guestThaw(['x;reboot'], 'abc123')
+
+        then:
+        thrown(IllegalArgumentException)
+
+        when:
+        HostScripts.guestFreeze(MP, 'A B')
+
+        then:
+        thrown(IllegalArgumentException)
+    }
+    def 'a freeze that fails or times out is thawed at once and keeps its safety timer; a failed thaw keeps it too'() {
+        when:
+        def f = HostScripts.guestFreeze(MP, 'abc123')
+        def t = HostScripts.guestThaw(['vm-1'], 'abc123')
+        String failBranch = f.substring(f.indexOf('else', f.indexOf('virsh domfsfreeze')), f.indexOf('SKIPPED=$d|$(echo'))
+
+        then:
+        failBranch.contains('virsh domfsthaw "$d"')
+        !failBranch.contains('systemctl stop')
+        t.indexOf('systemctl stop') < t.indexOf('THAW_FAILED')       // stopped only in the success branch
+        t.indexOf('THAWED=vm-1') < t.indexOf('systemctl stop')
+    }
 }
