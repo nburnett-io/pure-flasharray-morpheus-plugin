@@ -237,11 +237,32 @@ echo "FlashArray node records: $({ iscsi_ok iscsiadm -m node 2>/dev/null; } | gr
             }
             sb << "if OUT=\$(timeout ${HVMCLI_CONFIGURE_TIMEOUT_SEC} hvmcli storage iscsi configure --portal '${p}:3260' --json 2>&1); then\n"
             sb << "  echo 'logged in to ${p} (hvmcli storage iscsi configure, as Morpheus does)'\n"
-            sb << "else\n  echo \"WARN hvmcli configure ${p} failed: \$(echo \"\$OUT\" | tr '\\n' ' ' | tail -c 300)\"\nfi\n"
+            sb << "else\n  echo \"WARN hvmcli configure ${p} failed: \$(echo \"\$OUT\" | tr '\\n' ' ' | tail -c 300)\"\n"
+            sb << defaultIfaceFallback(p)
+            sb << "fi\n"
         }
         sb << 'iscsi_ok iscsiadm -m session --rescan >/dev/null 2>&1 || echo "WARN session rescan failed"\n'
         sb << 'echo "FlashArray sessions now: $({ iscsi_ok iscsiadm -m session 2>/dev/null; } | grep -c purestorage || true)"\n'
         sb
+    }
+
+    /**
+     * hvmcli's discovery names no iface, so iscsiadm tries every iface record on the host; one bound to the other
+     * fabric's NIC (or a missing one) times it out even though the portal answers. Discovery and login limited to the
+     * "default" iface give the same session Morpheus makes. `-o new` adds records and never rewrites existing ones.
+     */
+    private static String defaultIfaceFallback(String p) {
+        """  if timeout ${DISCOVERY_TIMEOUT_SEC} iscsiadm -m discovery -t sendtargets -p ${p}:3260 -I default -o new >/dev/null 2>&1; then
+    iscsiadm -m node -p ${p}:3260 -I default -o update -n node.startup -v automatic >/dev/null 2>&1 || true
+    if iscsiadm -m node -p ${p}:3260 -I default --login >/dev/null 2>&1; then
+      echo '  logged in to ${p} on the default iface (discovery limited to it); hvmcli configure fails on this host: look for an iSCSI iface record bound to a NIC that is down or gone'
+    else
+      echo "  WARN login to ${p} on the default iface failed (exit \$?)"
+    fi
+  else
+    echo '  WARN discovery of ${p} on the default iface failed too: the host gets no answer from ${p}:3260 (VLAN, switch port, MTU)'
+  fi
+"""
     }
 
     /** Hosts without hvmcli (HVM 1.3): one iface per storage NIC, discovery and login through it. */

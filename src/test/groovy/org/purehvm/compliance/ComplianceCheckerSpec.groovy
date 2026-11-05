@@ -603,8 +603,26 @@ hvmbr0.62|198.51.100.21/24
         s.contains("SKIP portal 198.51.100.11: not a Morpheus iSCSI target")
         !s.contains('--initiator-name')                               // the host keeps its name
         !s.contains('iscsiadm -m iface')                              // Morpheus's virtual switch owns the ifaces
-        !s.contains('--login')
         s.contains('WARN hvmcli configure')                           // one portal failing does not stop the others
+    }
+
+    def 'when hvmcli configure fails, discovery and login fall back to the default iface only'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)
+
+        when:
+        String s = new Remediation().scriptSteps(f, ['iscsi-sessions'], ctx.portals, '6.10.4', '0',
+                [targets: ['192.0.2.11']])*.script.join('')
+        String fallback = s.substring(s.indexOf('WARN hvmcli configure 192.0.2.11 failed'))
+
+        then: 'only after configure failed, only that portal, only the default iface, adding records without rewriting'
+        s.indexOf("hvmcli storage iscsi configure --portal '192.0.2.11:3260'") < s.indexOf('-I default')
+        fallback.contains('iscsiadm -m discovery -t sendtargets -p 192.0.2.11:3260 -I default -o new')
+        fallback.contains('iscsiadm -m node -p 192.0.2.11:3260 -I default --login')
+        (s =~ /--login/).count == 1
+        !(s =~ /-I (?!default)\S+/)
+        fallback.contains('discovery of 192.0.2.11 on the default iface failed too')
+        !(s =~ /echo '[^'\n]*'[^\n]*'/)                               // no stray quote inside an echo
     }
 
     def 'with hvmcli and no Morpheus target list, every routed portal is wanted; gatewayed ones never'() {

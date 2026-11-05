@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.1 (2026-11-05)
+
+- **Fix: sessions on a host where `hvmcli storage iscsi configure` times out although the array answers.** hvmcli's
+  discovery names no iSCSI iface, so `iscsiadm` tries every iface record on the host, and one bound to the other
+  fabric's NIC, to a bridge that is down, or to a missing NIC times the whole discovery out. Seen on a new host whose
+  iSCSI virtual switch had been rebuilt: the first switch's iface records stayed behind, bound to its bridges (down, no
+  address), and configure timed out on all four portals while `iscsiadm -m discovery -t st -p <portal> -I default`
+  listed the targets. When configure fails for a
+  portal, Remediate (and Add / host join) now runs discovery and login for that portal on the `default` iface only,
+  the session Morpheus would have made, adding node records without rewriting existing ones. The job log says when the
+  fallback was needed (look at `iscsiadm -m iface` on that host) or when the portal does not answer at all.
+
 ## 0.13.0 (2026-11-05)
 
 **Hosts with no iSCSI set up yet, and iSCSI that follows Morpheus.** On HVM 2.0 Morpheus builds a host's iSCSI
