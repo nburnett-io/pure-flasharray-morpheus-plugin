@@ -56,6 +56,8 @@ class VmRestoreSpec extends Specification {
         VmRestore.isCopyRecord(new StorageVolume(name: 'acme-vm01/acme-vm01.file-restore-20261021202211-vda.qcow2'))
         VmRestore.isCopyRecord(new StorageVolume(name: 'x', externalId: 'acme-vm01/acme-vm01.file-restore-20261021202211-vda.qcow2'))
         !VmRestore.isCopyRecord(new StorageVolume(name: 'root', externalId: 'acme-vm01/hvm_3-disk-0-0a1b2c3'))
+        // a customer's own disk with the tag in its label is not a copy (its record used to be deleted)
+        !VmRestore.isCopyRecord(new StorageVolume(name: 'db.file-restore-old', externalId: 'acme-vm01/hvm_3-disk-1-0a1b2c3'))
     }
 
     def 'the VM\'s own tenant gets past the tenancy check (and on to the storage checks), told nothing about the storage'() {

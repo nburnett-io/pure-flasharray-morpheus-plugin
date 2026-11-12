@@ -252,7 +252,8 @@ class RecoverySessions {
                     log.warn("GFS2 lock guard on ${c.name} failed: ${e.message}", e)
                 }
                 try {
-                    IscsiFabricGuard.run(morpheus, ctx, settings)
+                    // it logs sessions out: never beside a user's job (Apply MTU, Remediate, Retire); next pass otherwise
+                    Jobs.tryExclusive(c.id, 'iSCSI session check') { IscsiFabricGuard.run(morpheus, ctx, settings) }
                 } catch (Exception e) {
                     log.warn("iSCSI fabric guard on ${c.name} failed: ${e.message}", e)
                 }
@@ -263,7 +264,8 @@ class RecoverySessions {
                 }
                 FileRestoreCopies.sweep(morpheus, ctx, settings)
                 try {
-                    SnapshotIndex.indexPending(morpheus, ctx)
+                    // it clones, connects and mounts LUNs on a host: same rule
+                    Jobs.tryExclusive(c.id, 'snapshot indexing') { SnapshotIndex.indexPending(morpheus, ctx) }
                 } catch (Exception e) {
                     log.warn("snapshot index pass on ${c.name} failed: ${e.message}", e)
                 }

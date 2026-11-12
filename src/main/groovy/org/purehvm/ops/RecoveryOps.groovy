@@ -208,7 +208,22 @@ class RecoveryOps {
         try {
             (vm.disks as List<Map>).each { Map d ->
                 // a missing live file is restored too: the VM's record and definition still point at it (GFS2 repair)
-                HostRunner.Result r = runner.run(s.host, HostScripts.restoreVmDisk(d.snapPath as String, s.mount, prodMount, d.path as String, ts, true))
+                // copy first (long), then make sure the VM is still off on its own host, then the short swap: a VM started
+                // during the copy would keep writing to the renamed old file and boot the snapshot next time
+                Closure<String> script = { HostScripts.RestorePhase ph ->
+                    HostScripts.restoreVmDisk(d.snapPath as String, s.mount, prodMount, d.path as String, ts, true, ph)
+                }
+                HostRunner.Result r = runner.run(s.host, script(HostScripts.RestorePhase.PREPARE))
+                if (!r.ok) {
+                    throw new IllegalStateException("${d.target}: ${r.error}")
+                }
+                if (vm.host && vm.domain) {
+                    HostRunner.Result st = runner.run(vm.host as String, HostScripts.vmDisks(vm.domain as String))
+                    if (!st.ok || !(st.kv.STATE as String)?.contains('shut off')) {
+                        throw new IllegalStateException("${d.target}: ${vm.name} is no longer powered off (libvirt state: ${st.kv.STATE ?: st.error}); nothing was replaced")
+                    }
+                }
+                r = runner.run(s.host, script(HostScripts.RestorePhase.SWAP))
                 if (!r.ok) {
                     throw new IllegalStateException("${d.target}: ${r.error}")
                 }

@@ -75,7 +75,8 @@ ACTION=="add|change", KERNEL=="sd*[!0-9]", SUBSYSTEM=="block", ENV{ID_VENDOR}=="
         StringBuilder sb = new StringBuilder('# Managed by the Pure FlashArray for HVM Morpheus plugin.\n')
         sb << '# Storage NICs share a subnet: answer ARP only on the owning NIC, loose reverse-path filtering.\n'
         (['all', 'default'] + nics.sort()).each { String i ->
-            sb << "net.ipv4.conf.${i}.arp_ignore = 2\nnet.ipv4.conf.${i}.arp_announce = 2\nnet.ipv4.conf.${i}.rp_filter = 2\n"
+            // slash form: in the dotted form a VLAN NIC's own dot (ens2f0.60) reads as another level and the key fails
+            sb << "net/ipv4/conf/${i}/arp_ignore = 2\nnet/ipv4/conf/${i}/arp_announce = 2\nnet/ipv4/conf/${i}/rp_filter = 2\n"
         }
         sb.toString()
     }
@@ -125,10 +126,12 @@ ACTION=="add|change", KERNEL=="sd*[!0-9]", SUBSYSTEM=="block", ENV{ID_VENDOR}=="
 
         if ('packages' in want) {
             // a freshly installed host can have stale package lists: refresh once and retry
+            // --no-upgrade: only what is missing. Upgrading an installed open-iscsi or multipath-tools restarts iscsid
+            // and multipathd under running VMs.
             add('install packages', new StringBuilder('''PKGS="open-iscsi multipath-tools sg3-utils gfs2-utils"
-if ! apt-get install -y -q $PKGS; then
+if ! apt-get install -y -q --no-upgrade $PKGS; then
   echo "install failed; refreshing package lists and retrying"
-  apt-get update -q && apt-get install -y -q $PKGS
+  apt-get update -q && apt-get install -y -q --no-upgrade $PKGS
 fi
 '''))
         }
@@ -210,6 +213,13 @@ fi
   ip="${portal%:*}"
   if grep -q "^${ip}|" <<<"$LIVE" && ! grep -qxF "${ip}|${iface}" <<<"$LIVE"; then
     echo "left ${ip} via ${iface} alone: the session to ${ip} uses another record"
+    continue
+  fi
+  # never arm a record that would log in through a gateway or out of the other fabric's NIC (ISC-03b removes those)
+  rt=$(ip -o route get "$ip" 2>/dev/null); rdev=$(echo "$rt" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p')
+  nd=$(iscsiadm -m iface -I "$iface" 2>/dev/null | sed -n 's/^iface.net_ifacename = //p'); [ "$nd" = "<empty>" ] && nd=""
+  if echo "$rt" | grep -q ' via ' || { [ -n "$nd" ] && [ "$nd" != "$rdev" ] && [ -z "$(ip -o route show to match "$ip" dev "$nd" scope link 2>/dev/null)" ]; }; then
+    echo "left ${ip} via ${iface} alone: not on this portal's own fabric"
     continue
   fi
   for kv in node.startup=automatic node.conn[0].timeo.noop_out_interval=5 node.conn[0].timeo.noop_out_timeout=5; do
@@ -352,7 +362,9 @@ echo "FlashArray node records: $({ iscsi_ok iscsiadm -m node 2>/dev/null; } | gr
             String nic = f.routes[p]
             String ifaceName = f.ifaces.find { it.netdev == nic }?.name ?: nic
             // a portal that does not answer must not abort the rest (iscsiadm exit 11 = PDU timeout)
-            sb << "if timeout ${DISCOVERY_TIMEOUT_SEC} iscsiadm -m discovery -t sendtargets -p ${p}:3260 -I ${ifaceName} >/dev/null 2>&1; then\n"
+            // -o new: add missing records only. Plain discovery rewrites the existing ones from iscsid.conf (startup
+            // manual on Ubuntu), and the portals already logged in would not come back after a reboot.
+            sb << "if timeout ${DISCOVERY_TIMEOUT_SEC} iscsiadm -m discovery -t sendtargets -p ${p}:3260 -I ${ifaceName} -o new >/dev/null 2>&1; then\n"
             // Discovery through one iface returns every array portal; keep only same-fabric records not in use.
             portals.findAll { String other -> f.routes[other] && f.routes[other] != nic && !livePairs.contains("${other}|${nic}".toString()) }.each { String other ->
                 sb << "  iscsiadm -m node -p ${other}:3260 -I ${ifaceName} -o delete >/dev/null 2>&1 || true\n"

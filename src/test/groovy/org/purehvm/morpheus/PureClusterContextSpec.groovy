@@ -59,6 +59,26 @@ class PureClusterContextSpec extends Specification {
         ctx.links == [[storageServerId: 4L, hostGroup: 'hg-a']]
     }
 
+    def 'a link change is applied to the links stored now, not to this context\'s old copy'() {
+        given: 'a context built before another array was linked (a host-join job waits many minutes)'
+        ComputeServerGroup old = new ComputeServerGroup(id: 15, name: 'cluster-a')
+        old.setConfigProperty('pureLinks', [[storageServerId: 4, hostGroup: 'hg-a']])
+        ComputeServerGroup fresh = new ComputeServerGroup(id: 15, name: 'cluster-a')
+        fresh.setConfigProperty('pureLinks', [[storageServerId: 4, hostGroup: 'hg-a'], [storageServerId: 9, hostGroup: 'hg-new']])
+        int n = 0
+        def clusters = Stub(MorpheusSynchronousComputeServerGroupService) {
+            get(15L) >> { n++ == 0 ? old : fresh }
+            list(_) >> [fresh]
+            save(_) >> { args -> args[0] }
+        }
+        def stale = new PureClusterContext(Stub(MorpheusContext) { getServices() >> Stub(MorpheusServices) { getCluster() >> clusters } }, 15L)
+
+        when:
+        stale.setLink(4L, 'hg-a2')
+
+        then: 'the link added meanwhile survives'
+        PureClusterContext.linksOf(fresh).sort { it.storageServerId } == [[storageServerId: 4L, hostGroup: 'hg-a2'], [storageServerId: 9L, hostGroup: 'hg-new']]
+    }
     def 'two clusters may share an array but never a host group on it'() {
         given:
         c16.setConfigProperty('pureLinks', [[storageServerId: 4, hostGroup: 'hg-cluster-b']])

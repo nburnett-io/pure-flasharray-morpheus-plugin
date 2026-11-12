@@ -25,6 +25,18 @@ class HostGroupPlannerSpec extends Specification {
         !p.blocked
     }
 
+    def 'two nodes with the same initiator name are a blocker, not a healthy no-op'() {
+        given: 'hvm02 is a clone of hvm01 and both match the one array host'
+        def twins = [new Node('hvm01.example.invalid', ['iqn.2024-12.com.hpe:hvm01:aaa']), new Node('hvm02.example.invalid', ['IQN.2024-12.com.hpe:hvm01:aaa'])]
+        def hosts = [new ArrayHost('hvm01', ['iqn.2024-12.com.hpe:hvm01:aaa'], 'hvm-a', 0)]
+
+        when:
+        def p = planner.plan('hvm-a', twins, hosts, ['hvm-a'])
+
+        then:
+        p.blocked
+        p.blockers.any { it.contains('same iSCSI initiator name') && it.contains('hvm01.example.invalid') && it.contains('hvm02.example.invalid') }
+    }
     def 'fully configured cluster is a no-op'() {
         given:
         def hosts = nodes.collect { new ArrayHost(it.name.tokenize('.')[0], it.iqns, 'hvm-a', 0) }

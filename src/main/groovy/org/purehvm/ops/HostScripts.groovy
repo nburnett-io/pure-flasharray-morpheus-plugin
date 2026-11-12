@@ -339,6 +339,18 @@ snapconvert() {
 }
 '''
 
+    /** How long the plugin waits for one host script (PureClusterContext.SCRIPT_TIMEOUT_SEC). */
+    static final int RUNNER_TIMEOUT_SEC = 3600
+    /**
+     * After a long copy and before the step that changes the VM: stop if the plugin has given up waiting. It has then
+     * reported a failure (and rolled other disks back), so finishing the change behind its back would leave the VM
+     * half-restored. Needs TMP.
+     */
+    private static final String STILL_WAITED = "[ \"\$SECONDS\" -lt ${RUNNER_TIMEOUT_SEC - 60} ] || { rm -f \"\$TMP\"; echo \"ERROR=the copy took longer than the plugin waits for one disk (${RUNNER_TIMEOUT_SEC.intdiv(60)} min); nothing was changed\"; exit 9; }"
+
+    /** restoreVmDisk in one go, or split so the caller can re-check the VM is still off between the copy and the swap. */
+    enum RestorePhase { ALL, PREPARE, SWAP }
+
     /**
      * File-level restore: a standalone copy of a snapshot-time disk as {@code dest} (in the VM's own directory), hot-
      * attached to the RUNNING domain as the first free virtio target, live only - it is not in the domain's persistent
@@ -358,6 +370,7 @@ USED=" \$(virsh domblklist "\$DOM" 2>/dev/null | awk 'NR>2 && \$1!="" {print \$1
 TGT=""; for l in b c d e f g h i j k l m n o p q r s t u v w x y z; do case "\$USED" in *" vd\$l "*) ;; *) TGT="vd\$l"; break;; esac; done
 [ -n "\$TGT" ] || { echo "ERROR=no free disk slot"; exit 3; }
 snapconvert "\$SRC" "\$TMP"
+${STILL_WAITED}
 mv "\$TMP" "\$DEST" || { rm -f "\$TMP"; echo "ERROR=move failed"; exit 8; }
 virsh attach-disk "\$DOM" "\$DEST" "\$TGT" --live --driver qemu --subdriver qcow2 --targetbus virtio --cache none >/dev/null 2>&1 \\
   || { rm -f "\$DEST"; echo "ERROR=attach failed"; exit 9; }
@@ -459,8 +472,12 @@ true
         }
     }
 
+    static boolean isRelPath(String p) {
+        p ==~ /[A-Za-z0-9._][A-Za-z0-9._\/-]*/ && !p.contains('..') && !p.contains('//')
+    }
+
     private static void requireRelPath(String p) {
-        if (!(p ==~ /[A-Za-z0-9._][A-Za-z0-9._\/-]*/) || p.contains('..') || p.contains('//')) {
+        if (!isRelPath(p)) {
             throw new IllegalArgumentException("Unsafe relative path: ${p}")
         }
     }
@@ -610,7 +627,8 @@ rm -f "\$TM"
      * there is nothing to keep. The copy is linked into place with ln, so a file that appears meanwhile is never
      * overwritten. Without it the missing file is an error, as for "add as a new disk" (the target must exist).
      */
-    static String restoreVmDisk(String source, String recoveryMount, String prodMount, String dest, String ts, boolean allowMissing = false) {
+    static String restoreVmDisk(String source, String recoveryMount, String prodMount, String dest, String ts, boolean allowMissing = false,
+                                RestorePhase phase = RestorePhase.ALL) {
         [source, recoveryMount, prodMount, dest].each { requireSafePath(it) }
         if (!(ts ==~ /[0-9]{8,14}/)) {
             throw new IllegalArgumentException('bad timestamp')
@@ -632,7 +650,9 @@ else
   D=\$(dirname "\$DEST"); mkdir -p "\$D" || { echo "ERROR=cannot create \$D"; exit 2; }
   OWN=\$(stat -c %u:%g "\$D"); MODE=644
 fi
-snapconvert "\$SRC" "\$TMP"
+${phase == RestorePhase.SWAP ? '[ -s "$TMP" ] || { echo "ERROR=the prepared copy $TMP is missing"; exit 2; }'
+                : 'snapconvert "$SRC" "$TMP"'}
+${phase == RestorePhase.PREPARE ? 'echo "READY=$TMP"; exit 0' : (phase == RestorePhase.ALL ? STILL_WAITED : '')}
 if [ -n "\$MISSING" ]; then
   ln "\$TMP" "\$DEST" || { rm -f "\$TMP"; echo "ERROR=\$DEST appeared while restoring; nothing replaced"; exit 8; }
   rm -f "\$TMP"
@@ -952,7 +972,9 @@ sessions() { iscsiadm -m session -P1 2>/dev/null | awk '
 reason() { local ip=$1 nd=$2 r dev via
   r=$(ip -o route get "$ip" 2>/dev/null); dev=$(echo "$r" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p'); via=$(echo "$r" | sed -n 's/.* via \\([^ ]*\\).*/\\1/p')
   if [ -n "$via" ]; then echo "routed through gateway $via"; return; fi
-  if [ -n "$nd" ] && [ -n "$dev" ] && [ "$nd" != "$dev" ]; then echo "crossed: $ip is on the subnet of $dev, session goes out $nd"; fi; }
+  # a second NIC with its own connected route to the portal's subnet (two storage NICs in one subnet) is a real path
+  if [ -n "$nd" ] && [ -n "$dev" ] && [ "$nd" != "$dev" ] && [ -z "$(ip -o route show to match "$ip" dev "$nd" scope link 2>/dev/null)" ]; then
+    echo "crossed: $ip is on the subnet of $dev, session goes out $nd"; fi; }
 ALL=$(sessions)
 GOOD=""; BAD=""
 while IFS='|' read -r t ip port iface nd st; do

@@ -453,6 +453,7 @@ class RetireOps {
         if (!PureNames.ownedBy(tags, ctx.cluster.id) || tags['morpheus-datastore-id'] != datastoreId as String) {
             throw new IllegalStateException("${volume} is not tagged as datastore ${datastoreId} of cluster ${ctx.cluster.name}; refusing to touch it")
         }
+        ctx.requireOwnConnections(fa, volume)
         // the mount path is on the Morpheus record, which the delete removes: read it first (for the pool cleanup)
         String mountPath = morpheus.services.cloud.datastore.get(datastoreId)?.externalPath
         if (deleteFirst) {

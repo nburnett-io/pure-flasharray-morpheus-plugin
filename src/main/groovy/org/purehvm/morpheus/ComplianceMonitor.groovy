@@ -46,17 +46,20 @@ class ComplianceMonitor {
         }
         List<String> portals = []
         Set<String> iqns = [] as Set
+        List<Set<String>> iqnsPerArray = []
         List<String> versions = []
         links.each { Map l ->
             ctx.withArray(l.storageServerId as Long) { FlashArrayClient fa ->
                 portals.addAll(fa.listIscsiPortals()*.address as List<String>)
-                iqns.addAll(fa.listHosts().collectMany { (it.iqns ?: []) as List<String> })
+                Set<String> here = fa.listHosts().collectMany { (it.iqns ?: []) as List<String> } as Set<String>
+                iqnsPerArray << here
+                iqns.addAll(here)
                 versions << (fa.array.version as String)
             }
         }
         portals = portals.unique()
         portals.each { if (!(it ==~ /[0-9a-fA-F.:]+/)) { throw new IllegalStateException("unexpected portal address ${it}") } }
-        [portals: portals, iqns: iqns, purity: versions.findAll { it ==~ /\d+(\.\d+)*/ }.min { a, b -> FlashArrayClient.compareVersions(a, b) } ?: versions.find()]
+        [portals: portals, iqns: iqns, iqnsPerArray: iqnsPerArray, purity: versions.findAll { it ==~ /\d+(\.\d+)*/ }.min { a, b -> FlashArrayClient.compareVersions(a, b) } ?: versions.find()]
     }
 
     /** The read-only host probe (compliance, remediation), run with the array portals as its arguments. */
@@ -79,7 +82,8 @@ class ComplianceMonitor {
     static List<Map> check(PureClusterContext ctx, String only = null, Map settings = [:]) {
         Map info = arrayFacts(ctx)
         ComplianceChecker.Context cc = new ComplianceChecker.Context(info.portals as List<String>, info.iqns as Set<String>, info.purity as String,
-                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings), ctx.storageMtu)
+                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings), ctx.storageMtu,
+                info.iqnsPerArray as List<Set<String>>)
         ctx.onAllHosts(probe(info.portals as List<String>), only ? [only] : ctx.hostNames).collect { String h, HostRunner.Result res ->
             hostView(h, res, cc)
         }

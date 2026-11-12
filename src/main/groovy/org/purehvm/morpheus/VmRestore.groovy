@@ -38,7 +38,8 @@ import java.time.format.DateTimeFormatter
 class VmRestore {
     static final DateTimeFormatter WHEN = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'").withZone(ZoneOffset.UTC)
     /** A clone target created this recently is the tab's own fresh VM: the images it replaces are template copies. */
-    static final long FRESH_MS = 24L * RecoverySessions.HOUR_MS
+    /** 2 hours: enough for the tab to provision the new VM (it waits 30 min at most) and copy; a VM built yesterday keeps its disks. */
+    static final long FRESH_MS = 2L * RecoverySessions.HOUR_MS
 
     final MorpheusContext morpheus
     final List<String> progress
@@ -152,8 +153,14 @@ class VmRestore {
             log.info("restore: ${inst.name} has no host in cluster ${ctx.cluster.name}")
             throw new PublicError("${inst.name} is not running on a host restore can reach right now")
         }
+        if (!s.externalId) {
+            // never fall back to the VM's NAME as its libvirt domain: a renamed, half-provisioned record could then
+            // point at another tenant's domain on the same host
+            log.info("restore: ${inst.name} (server ${s.id}) has no libvirt id (externalId) in Morpheus")
+            throw new PublicError("${inst.name} is not fully provisioned yet; restore is not available for it")
+        }
         new Target(instance: inst, server: s, datastore: ds, ctx: ctx, array: arr, hostName: hostName,
-                domain: s.externalId ?: s.name, disks: disks)
+                domain: s.externalId, disks: disks)
     }
 
     /** Whether the user operates the cluster the VM's disks are on (found without revealing anything on failure). */
@@ -171,7 +178,9 @@ class VmRestore {
      * directory). Such records are never treated as the VM's disks, and are deleted once the copy is not attached.
      */
     static boolean isCopyRecord(StorageVolume v) {
-        "${v.externalId ?: ''} ${v.name ?: ''}".contains(".${HostScripts.FILE_RESTORE_TAG}-")
+        // the whole copy-file name at the end (.file-restore-<14 digits>-<dev>.qcow2), not just the tag anywhere: a
+        // customer's own disk labelled "db.file-restore-old" must never be taken for a copy (its record was deleted)
+        [v.externalId, v.name].any { String s -> s != null && s ==~ /.*${HostScripts.COPY_SUFFIX}/ }
     }
 
     /**
@@ -378,6 +387,9 @@ class VmRestore {
             String which = volumeIds ? 'disk ' + chosen*.name.join(', ') : "all ${disks.size()} disk(s)"
             say("restoring ${which} of ${t.instance.name}")
             Map r = ops.restoreVmInPlace(s, pm, vm + [disks: disks, restorable: true])
+            // a disk resized after the restore point comes back at its old size: grow it to what Morpheus records
+            // (as add-disk and clone do), or the record, the bill and the next resize are all wrong
+            [disks, chosen].transpose().each { Map d, StorageVolume v -> grow(t.ctx.runner, s.host, d.path as String, v.maxStorage) }
             say("${t.instance.name}: ${which} back to ${when(snap.created)}. The replaced disks are kept until your provider removes them.")
             [instanceId: t.instance.id, restoredTo: snap.created, disks: (r.disks as List).size()]
         }
@@ -584,7 +596,8 @@ class VmRestore {
                 }
                 d + [path: target]
             }
-            Map res = ops.restoreVmInPlace(s, dstPm, [name: dst.instance.name, domainState: td.kv.STATE, restorable: true, disks: disks])
+            Map res = ops.restoreVmInPlace(s, dstPm, [name: dst.instance.name, host: dst.hostName, domain: dst.domain, domainState: td.kv.STATE,
+                                                      restorable: true, disks: disks])
             say("${dst.instance.name}: ${disks.size()} disk(s) copied from ${src.instance.name} as of ${when(snap.created)}")
             res
         }

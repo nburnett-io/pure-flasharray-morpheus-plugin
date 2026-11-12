@@ -108,6 +108,13 @@ class HostGroupPlanner {
             return p
         }
 
+        // two nodes with one initiator name (cloned hosts) would both match the same array host and read as "OK"
+        Map<String, List<String>> users = [:]
+        nodes.each { Node n -> (n.iqns ?: [] as List<String>).collect { normalizeIqn(it) }.unique().each { String q -> users.computeIfAbsent(q) { [] } << n.name } }
+        users.findAll { q, names -> names.size() > 1 }.each { String q, List<String> names ->
+            p.blockers << "${names.join(' and ')} use the same iSCSI initiator name (${q}); give each host its own in /etc/iscsi/initiatorname.iscsi".toString()
+        }
+
         Map<String, ArrayHost> byIqn = [:]
         arrayHosts.each { ArrayHost h -> h.iqns.each { String q -> byIqn[normalizeIqn(q)] = h } }
 

@@ -382,6 +382,19 @@ overrides|no_path_retry|queue
         expect:
         rs.find { it.id == 'ISC-03b' }.with { status == Status.FAIL && fix == 'cross-fabric' && observed == "${p62} via ens2f0.60".toString() }
     }
+    def 'a second NIC in the SAME subnet as the portal is a real path, not a crossed session'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)
+        String target = f.pureSessions[0].target
+        String p62 = ctx.portals.find { f.routes[it] == 'ens2f1.62' }
+        f.addrs['ens2f0.60'] = [p62.replaceAll(/\d+$/, '77') + '/24']      // ens2f0.60 also has an address on that portal's subnet
+        f.sessions = [[target: target, portal: p62, iface: 'ens2f0.60', netdev: 'ens2f0.60', state: 'LOGGED_IN', viaNic: 'ens2f0.60']]
+
+        expect:
+        HostFacts.onSubnet('192.0.2.9', ['192.0.2.200/24']) && !HostFacts.onSubnet('198.51.100.9', ['192.0.2.200/24']) && !HostFacts.onSubnet('192.0.2.9', null)
+        !new ComplianceChecker().check(f, ctx).any { it.id == 'ISC-03b' }
+        HostScripts.removeCrossFabricSessions(false).contains('ip -o route show to match "$ip" dev "$nd" scope link')
+    }
 
     def 'the cross-fabric removal script is path-guarded and has a dry run'() {
         when:
@@ -744,8 +757,8 @@ hvmbr0.62|198.51.100.21/24
         String s = new Remediation().scriptSteps(freshHost(false), ['packages'], ctx.portals, '6.10.4')[0].script
 
         then:
-        s.contains('if ! apt-get install -y -q $PKGS; then')
-        s.contains('apt-get update -q && apt-get install -y -q $PKGS')
+        s.contains('if ! apt-get install -y -q --no-upgrade $PKGS; then')
+        s.contains('apt-get update -q && apt-get install -y -q --no-upgrade $PKGS')
     }
 
     def 'on hvmcli hosts an unbound storage NIC points at the Morpheus iSCSI switch instead of offering a fix'() {

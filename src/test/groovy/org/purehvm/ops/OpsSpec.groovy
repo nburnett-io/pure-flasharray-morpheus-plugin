@@ -82,6 +82,47 @@ class OpsSpec extends Specification {
         order.last() == 'array:eradicate'
     }
 
+    def 'provision: a failure while Morpheus creates the datastore never rolls the LUN back'() {
+        given: 'the call to Morpheus times out; Morpheus may still be formatting and mounting the LUN'
+        def r = runner(['iscsiadm -m session --rescan': { h -> new HostRunner.Result(0, "SIZE=${100 * GIB}\nPATHS=4") }])
+        def registrar = Mock(Gfs2Registrar)
+        def progress = []
+        def ops = new DatastoreOps(fa, r, ['hvm01', 'hvm02'], registrar, progress)
+
+        when:
+        ops.provisionGfs2(7L, 'hg', 'DS01', 100 * GIB)
+
+        then:
+        1 * registrar.register(*_) >> { throw new IllegalStateException('timed out') }
+        thrown(IllegalStateException)
+        !order.any { it in ['array:disconnect', 'array:destroy', 'array:eradicate'] }
+        !order.any { it.endsWith(':CLEAN=1') }
+        progress.any { it.contains('LEFT in place') }
+    }
+
+    def 'a grow that failed after the array resize is finished by asking for the same size again'() {
+        given: 'the array volume is already 200 GiB'
+        fake.on('GET', '/volumes?names=DS01') { u, h, b -> ok([items: [[name: 'DS01', serial: SERIAL, provisioned: 200 * GIB]]]) }
+        def r = runner([
+                'gfs2_grow'            : { h -> new HostRunner.Result(0, "FSSIZE=${200 * GIB}") },
+                'multipathd resize map': { h -> new HostRunner.Result(0, "SIZE=${200 * GIB}\nMOUNT=/mnt/abc") },
+        ])
+        def ops = new DatastoreOps(fa, r, ['hvm01', 'hvm02'], Mock(Gfs2Registrar))
+
+        when:
+        def g = ops.grow(7L, 'DS01', 200 * GIB)
+
+        then:
+        !order.contains('array:resize')
+        order.count { it.endsWith(':gfs2_grow') } == 1
+        g.fsBytes == 200 * GIB
+
+        when: 'smaller is still refused'
+        ops.grow(7L, 'DS01', 100 * GIB)
+
+        then:
+        thrown(IllegalArgumentException)
+    }
     def 'grow refuses gfs2_grow until every host reports the new size'() {
         given:
         fake.on('GET', '/volumes?names=DS01') { u, h, b -> ok([items: [[name: 'DS01', serial: SERIAL, provisioned: 100 * GIB]]]) }
@@ -170,6 +211,7 @@ class OpsSpec extends Specification {
         given:
         int n = 0
         def r = runner([
+                'READY=' : { h -> new HostRunner.Result(0, 'READY=x') },   // the copy; the swap is the KEEP= entry
                 'UNDONE=': { h -> new HostRunner.Result(0, 'UNDONE=x') },
                 'KEEP='  : { h -> n++ == 0 ? new HostRunner.Result(0, 'KEPT=/mnt/prod/vm1/root.qcow2.pre-restore-1\nSIZE=1') : new HostRunner.Result(4, 'ERROR=convert failed') },
         ])
@@ -223,6 +265,7 @@ class OpsSpec extends Specification {
         given:
         int n = 0
         def r = runner([
+                'READY=' : { h -> new HostRunner.Result(0, 'READY=x') },   // the copy; the swap is the KEEP= entry
                 'UNDONE=': { h -> new HostRunner.Result(0, 'UNDONE=x') },
                 'KEEP='  : { h -> n++ == 0 ? new HostRunner.Result(0, 'MISSING=1\nSIZE=1') : new HostRunner.Result(4, 'ERROR=convert failed') },
         ])
@@ -239,6 +282,40 @@ class OpsSpec extends Specification {
         order.count { it.endsWith(':UNDONE=') } == 0
         progress.any { it.contains('was missing; written from') }
         progress.any { it.contains('kept the restored vda') }
+    }
+
+    def 'a VM started during the copy is not swapped: the state is re-checked on its host between copy and swap'() {
+        given:
+        def r = runner([
+                'READY='     : { h -> new HostRunner.Result(0, 'READY=x') },
+                'domblklist' : { h -> new HostRunner.Result(0, 'STATE=running') },
+                'KEEP='      : { h -> new HostRunner.Result(0, 'KEPT=x\nSIZE=1') },
+        ])
+        def vm = [name: 'vm1', serverId: 7L, host: 'hvm02', domain: 'vm1', domainState: 'shut off', restorable: true, disks: [
+                [target: 'vda', path: '/mnt/prod/vm1/root.qcow2', snapPath: '/mnt/pure-recover-abc123/vm1/root.qcow2']]]
+
+        when:
+        new RecoveryOps(fa, r).restoreVmInPlace(session(), '/mnt/prod', vm)
+
+        then:
+        def e = thrown(IllegalStateException)
+        e.message.contains('no longer powered off')
+        order.count { it.endsWith(':KEEP=') } == 0      // the swap never ran
+    }
+
+    def 'the restore script splits into copy and swap, and the one-go form stops if the plugin gave up waiting'() {
+        when:
+        def args = ['/mnt/pure-recover-a/vm1/root.qcow2', '/mnt/pure-recover-a', '/mnt/prod', '/mnt/prod/vm1/root.qcow2', '20261112120000', false]
+        def prep = HostScripts.restoreVmDisk(*args, HostScripts.RestorePhase.PREPARE)
+        def swap = HostScripts.restoreVmDisk(*args, HostScripts.RestorePhase.SWAP)
+        def all = HostScripts.restoreVmDisk(*args)
+
+        then:
+        prep.contains('snapconvert "$SRC" "$TMP"') && prep.contains('echo "READY=$TMP"; exit 0')
+        !swap.contains('snapconvert "$SRC" "$TMP"') && swap.contains('the prepared copy $TMP is missing') && swap.contains('mv "$DEST" "$KEEP"')
+        all.contains('"$SECONDS" -lt 3540') && all.indexOf('"$SECONDS" -lt') < all.indexOf('mv "$DEST" "$KEEP"')
+        HostScripts.fileRestoreAttach('/mnt/pure-recover-a/vm1/root.qcow2', '/mnt/pure-recover-a',
+                '/mnt/prod/vm1/vm1.file-restore-20261020120000-vda.qcow2', 'vm1').contains('"$SECONDS" -lt 3540')
     }
 
     def 'file-restore copies are hot-attached live only, never into the persistent definition'() {

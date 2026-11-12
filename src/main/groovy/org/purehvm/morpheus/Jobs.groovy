@@ -33,6 +33,11 @@ class Jobs {
         }
     }
 
+    /** The cluster's one job slot is taken. An IllegalStateException, as callers that retry already catch that. */
+    static class BusyException extends IllegalStateException {
+        BusyException(String m) { super(m) }
+    }
+
     private static final Map<String, Job> JOBS = new ConcurrentHashMap<>()
     private static final Map<Long, String> RUNNING = new ConcurrentHashMap<>()
     private static final ExecutorService POOL = Executors.newCachedThreadPool()
@@ -50,7 +55,7 @@ class Jobs {
         Job j = new Job(id: UUID.randomUUID().toString(), kind: kind, clusterId: clusterId, user: user, meta: meta ?: [:])
         String other = RUNNING.putIfAbsent(clusterId, j.id)
         if (other != null) {
-            throw new IllegalStateException("Another Pure operation (${JOBS[other]?.kind}) is running on this cluster")
+            throw new BusyException("Another Pure operation (${JOBS[other]?.kind ?: other.replaceFirst('^background:', 'background ')}) is running on this cluster")
         }
         JOBS[j.id] = j
         POOL.submit {
@@ -72,6 +77,28 @@ class Jobs {
             }
         }
         j
+    }
+
+    /**
+     * Background work (the sweeper) that changes hosts or the array takes the same per-cluster slot as a job, on the
+     * calling thread: it never runs beside a user's job, and a job started meanwhile is told what is running.
+     * Returns false, without running {@code work}, when the cluster is busy.
+     */
+    static boolean tryExclusive(Long clusterId, String label, Closure work) {
+        String token = "background:${label}".toString()
+        if (RUNNING.putIfAbsent(clusterId, token) != null) {
+            return false
+        }
+        try {
+            work.call()
+        } finally {
+            RUNNING.remove(clusterId, token)
+        }
+        true
+    }
+
+    static boolean busy(Long clusterId) {
+        RUNNING.containsKey(clusterId)
     }
 
     static Job get(String id) {

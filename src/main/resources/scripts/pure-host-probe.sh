@@ -57,7 +57,7 @@ sec addrs;    ip -o -4 addr show 2>/dev/null | awk '{print $2"|"$4}'
 sec ping;     for p in $PORTALS; do if ping -c2 -W1 -M do -s 8972 "$p" >/dev/null 2>&1; then echo "$p|ok"; else echo "$p|fail"; fi; done
 sec sysctl
 for i in all default $(for p in $PORTALS; do ip -o route get "$p" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p'; done | sort -u); do
-  for k in arp_ignore arp_announce rp_filter; do echo "$i|$k|$(sysctl -n net.ipv4.conf.$i.$k 2>/dev/null)"; done
+  for k in arp_ignore arp_announce rp_filter; do echo "$i|$k|$(cat /proc/sys/net/ipv4/conf/$i/$k 2>/dev/null)"; done
 done
 # storage NIC|netplan file defining it (empty if none): who owns the host network (hvmcli virtSwitch, Morpheus base)
 sec netplan

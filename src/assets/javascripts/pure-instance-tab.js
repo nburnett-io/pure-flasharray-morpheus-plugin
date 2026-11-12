@@ -235,13 +235,20 @@
       });
     }
 
+    /** Before a mode that first creates a disk or a VM in Morpheus: refuse while the cluster is busy, so nothing is left behind. */
+    function notBusy() {
+      return call('vm-restore-points').then(function (d) {
+        if (d.busy) throw new Error('Another storage operation is running on this cluster right now. Nothing was changed; try again in a few minutes.');
+      });
+    }
+
     function addDisk(pt, diskId) {
       var d = state.vm, x = diskById(diskId);
       var volName = 'restored-' + x.name.replace(/[^A-Za-z0-9-]/g, '') + '-' + stampOf(pt.created, true);
       if (!confirm('Add disk "' + volName + '" to ' + d.name + ' holding disk ' + x.name + ' as of ' + when(pt.created) + '?')) return;
       var newVol;
       run('Add disk ' + x.name + ' as of ' + when(pt.created) + ' to ' + d.name + ' as ' + volName, function () {
-        return mapi('GET', '/api/instances/' + instanceId).then(function (j) {
+        return notBusy().then(function () { return mapi('GET', '/api/instances/' + instanceId); }).then(function (j) {
           var inst = j.instance, src = (inst.volumes || []).filter(function (v) { return String(v.id) === String(diskId); })[0];
           if (!src) throw new Error('disk ' + x.name + ' not found on the instance');
           var vols = (inst.volumes || []).map(function (v) { return lib.reconfVolume(v); });
@@ -288,7 +295,7 @@
           (powerOn ? 'It is started when ready.' : 'It is left stopped.'))) return;
       var newId;
       run('Clone ' + d.name + ' as of ' + when(pt.created) + ' into a new VM ' + name, function () {
-        return mapi('GET', '/api/instances/' + instanceId).then(function (j) {
+        return notBusy().then(function () { return mapi('GET', '/api/instances/' + instanceId); }).then(function (j) {
           say('Creating ' + name + ' (same size, disks and network as ' + d.name + ')...');
           return mapi('POST', '/api/instances', clonePayload(j.instance, name));
         }).then(function (j) {

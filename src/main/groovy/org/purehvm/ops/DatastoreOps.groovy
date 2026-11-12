@@ -97,6 +97,7 @@ class DatastoreOps {
         }
         Provisioned p = new Provisioned(volume: vol)
         boolean connected = false
+        boolean registering = false
         try {
             Map v = fa.createVolume(vol, bytes)
             p.serial = v.serial as String
@@ -115,15 +116,28 @@ class DatastoreOps {
             }
             step("${p.devicePath} visible on all ${hosts.size()} hosts")
 
+            registering = true
             p.datastoreId = registrar.register(clusterId, datastoreName, p.devicePath)
-            fa.tagVolume(vol, PureNames.tagNamespace, ['morpheus-datastore-id': p.datastoreId as String])
-            step("Morpheus GFS2 datastore ${datastoreName} created (id ${p.datastoreId})")
-            return p
         } catch (Exception e) {
+            if (registering) {
+                // Morpheus may have made the datastore even though the call failed (a timeout while it still works on
+                // it): the LUN may be formatted and in use, so it is never rolled back from here on
+                step("FAILED while Morpheus was creating the datastore: ${e.message}. Volume ${vol} is LEFT in place: " +
+                        'check the cluster\'s datastores in Morpheus; if none was made, remove the volume with Finish retire or on the array.')
+                throw e
+            }
             step("FAILED: ${e.message}; rolling back")
             rollbackNewVolume(p, connected)
             throw e
         }
+        // Morpheus owns the datastore now: a failed tag is a warning (Adopt can set it later), never a rollback
+        try {
+            fa.tagVolume(vol, PureNames.tagNamespace, ['morpheus-datastore-id': p.datastoreId as String])
+        } catch (Exception e) {
+            step("WARNING: could not tag ${vol} with its datastore id (${e.message}); use Adopt on the datastore")
+        }
+        step("Morpheus GFS2 datastore ${datastoreName} created (id ${p.datastoreId})")
+        return p
     }
 
     /** A volume this operation just created holds no data: remove it from hosts, then the array, then eradicate. */
@@ -159,12 +173,17 @@ class DatastoreOps {
         }
         newBytes = (newBytes >> 9) << 9
         long current = v.provisioned as Long
-        if (newBytes <= current) {
-            throw new IllegalArgumentException("New size must exceed the current ${current} bytes (GFS2 cannot shrink)")
+        if (newBytes < current) {
+            throw new IllegalArgumentException("New size must not be below the current ${current} bytes (GFS2 cannot shrink)")
         }
         String wwid = PureNames.wwid(v.serial as String)
-        fa.resizeVolume(volume, newBytes)
-        step("array volume ${volume} grown to ${newBytes} bytes")
+        if (newBytes == current) {
+            // a grow that failed after the array resize is finished by asking for the same size again
+            step("array volume ${volume} is already ${newBytes} bytes; finishing the host and filesystem steps")
+        } else {
+            fa.resizeVolume(volume, newBytes)
+            step("array volume ${volume} grown to ${newBytes} bytes")
+        }
 
         Map<String, HostRunner.Result> res = onAllHosts(HostScripts.resize(wwid))
         List<String> problems = res.findAll { h, r -> !r.ok || ((r.kv.SIZE ?: '0') as Long) != newBytes }

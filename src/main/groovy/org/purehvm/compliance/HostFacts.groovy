@@ -187,8 +187,29 @@ class HostFacts {
     }
 
     /** Interfaces the host uses to reach the array's iSCSI portals (one per fabric in a dual-fabric design). */
+    /**
+     * NICs that carry iSCSI: the one the routing table picks for each portal, plus any NIC an iSCSI iface is bound to
+     * that has an address on a portal's subnet (two storage NICs in ONE subnet: the route names only one of them).
+     */
     Set<String> getStorageInterfaces() {
-        routes.values() as Set<String>
+        Set<String> out = routes.values() as Set<String>
+        ifaces.findAll { it.netdev }.each { Map i ->
+            if (routes.keySet().any { String p -> onSubnet(p, addrs[i.netdev as String]) }) {
+                out << (i.netdev as String)
+            }
+        }
+        out
+    }
+
+    /** Whether an IPv4 address lies in the subnet of one of a NIC's addresses ("192.0.2.5", ["192.0.2.9/24"]). */
+    static boolean onSubnet(String ip, List<String> cidrs) {
+        if (!(ip ==~ /\d+\.\d+\.\d+\.\d+/)) {
+            return false
+        }
+        (cidrs ?: []).any { String c ->
+            c?.contains('/') && c.split('/')[0] ==~ /\d+\.\d+\.\d+\.\d+/ &&
+                    ComplianceChecker.network("${ip}/${c.split('/')[1]}".toString()) == ComplianceChecker.network(c)
+        }
     }
 
     List<Map> getPureSessions() {

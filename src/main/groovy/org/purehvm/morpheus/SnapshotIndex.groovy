@@ -26,6 +26,9 @@ class SnapshotIndex {
     static final long PASS_BUDGET_MS = 6L * 60 * 1000
     /** Snapshots older than this are not indexed by the sweeper (the tab offers at most 50 points anyway). */
     static final int MAX_POINTS = 50
+    /** Passes a snapshot may fail to open before it gets an empty index (so it is not retried for ever). */
+    static final int GIVE_UP_AFTER = 3
+    private static final Map<String, Integer> FAILED = new java.util.concurrent.ConcurrentHashMap<>()
 
     static String fileName(String snapshot) {
         snapshot.replaceAll(/[^A-Za-z0-9._-]/, '_').take(196) + '.idx'
@@ -45,7 +48,10 @@ class SnapshotIndex {
                 log.warn("snapshot index of ${s.snapshot}: listing failed: ${l.error}")
                 return false
             }
-            HostRunner.Result w = runner.run(s.host, HostScripts.writeSnapshotIndex(prodMount, fileName(s.snapshot), l.all('IDXFILE')))
+            // a name the scripts would refuse (a space, say: an uploaded ISO) can never be a VM disk the Restore tab
+            // matches, and must not stop the whole index from being written
+            List<String> names = l.all('IDXFILE').findAll { HostScripts.isRelPath(it) }
+            HostRunner.Result w = runner.run(s.host, HostScripts.writeSnapshotIndex(prodMount, fileName(s.snapshot), names))
             if (!w.ok) {
                 log.warn("snapshot index of ${s.snapshot}: write failed: ${w.error}")
             }
@@ -94,14 +100,28 @@ class SnapshotIndex {
                             stats.pending += 1
                             continue
                         }
-                        RecoveryOps.Session s = ops.openRecovery(arr.volume as String, snap.name as String, host, arrayHost,
-                                ctx.cluster.id, System.currentTimeMillis() + RecoverySessions.HOUR_MS)
+                        String key = "${ctx.cluster.id}|${snap.name}".toString()
                         try {
-                            if (save(ctx.runner, s, pm)) {
-                                stats.indexed += 1
+                            RecoveryOps.Session s = ops.openRecovery(arr.volume as String, snap.name as String, host, arrayHost,
+                                    ctx.cluster.id, System.currentTimeMillis() + RecoverySessions.HOUR_MS)
+                            try {
+                                if (save(ctx.runner, s, pm)) {
+                                    stats.indexed += 1
+                                    FAILED.remove(key)
+                                }
+                            } finally {
+                                ops.closeRecovery(s)
                             }
-                        } finally {
-                            ops.closeRecovery(s)
+                        } catch (Exception e) {
+                            // a snapshot that cannot be opened (taken before the filesystem existed, say) would be cloned
+                            // and torn down again on every pass for ever: after a few tries it gets an empty index
+                            int n = FAILED.merge(key, 1) { Integer a, Integer b -> a + b }
+                            log.warn("snapshot index: ${snap.name} on ${ctx.cluster.name} failed (${n}/${GIVE_UP_AFTER}): ${e.message}")
+                            if (n >= GIVE_UP_AFTER) {
+                                ctx.runner.run(host, HostScripts.writeSnapshotIndex(pm, fileName(snap.name as String), []))
+                                FAILED.remove(key)
+                                log.warn("snapshot index: ${snap.name} marked as holding no restorable disks")
+                            }
                         }
                     }
                 }

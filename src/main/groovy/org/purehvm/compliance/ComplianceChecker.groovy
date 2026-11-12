@@ -39,6 +39,7 @@ class ComplianceChecker {
         int toleranceWarnSeconds = DEFAULT_TOLERANCE_WARN_SECONDS
         boolean allowLowerToZero = false    // "Multipath: allow lowering to 0": a setting of 0 may replace a host's finite value
         int storageMtu = 9000               // the cluster's chosen iSCSI MTU (1500 or 9000)
+        List<Set<String>> registeredIqnsPerArray = []   // the same IQNs, one set per linked array (empty: only the union is known)
     }
 
     /** Inside HVM's own storage-loss clocks: all-paths-down at about 2 minutes, host offline at 140 s. */
@@ -86,9 +87,13 @@ class ComplianceChecker {
         // ---- iSCSI identity, bindings, sessions
         r << new Result('ISC-00', 'iSCSI initiator name configured', Severity.HIGH, f.iqn ? Status.PASS : Status.FAIL,
                 f.iqn ?: 'none in /etc/iscsi/initiatorname.iscsi', 'InitiatorName=iqn....', f.iqn ? null : 'iqn')
-        boolean iqnOk = f.iqn && (!ctx.registeredIqns || ctx.registeredIqns*.toLowerCase().contains(f.iqn.toLowerCase()))
+        // with several linked arrays the host must be registered on EACH one (the union would pass a host missing on one)
+        int missingOn = f.iqn ? ctx.registeredIqnsPerArray.count { Set<String> a -> !a*.toLowerCase().contains(f.iqn.toLowerCase()) } as int : 0
+        boolean iqnOk = f.iqn && (ctx.registeredIqnsPerArray ? missingOn == 0
+                : (!ctx.registeredIqns || ctx.registeredIqns*.toLowerCase().contains(f.iqn.toLowerCase())))
         r << new Result('ISC-01', 'Initiator IQN registered on the FlashArray', Severity.HIGH, iqnOk ? Status.PASS : Status.FAIL,
-                f.iqn ?: 'none', 'IQN present on an array host', null)
+                (f.iqn ?: 'none') + (missingOn ? " (not on ${missingOn} of ${ctx.registeredIqnsPerArray.size()} linked array(s))".toString() : ''),
+                'IQN present on an array host of every linked array', null)
 
         Set<String> storIfs = f.storageInterfaces
         // portals on a subnet this host has a NIC on; the rest are not storage paths for this host
@@ -130,7 +135,11 @@ class ComplianceChecker {
         r << new Result('ISC-03', 'Logged-in session to every directly connected portal', Severity.HIGH, noSession ? Status.FAIL : Status.PASS,
                 "${live.size()} session(s)${noSession ? '; missing ' + noSession.join(', ') : ''}".toString(),
                 "${reachable.size()} (one per portal on this host's storage subnets)".toString(), 'iscsi-sessions')
-        List<Map> crossFabric = live.findAll { Map s -> f.routes[s.portal] && s.viaNic && s.viaNic != f.routes[s.portal] }
+        // crossed = out of a NIC that is not on the portal's subnet. A second NIC in the SAME subnet is a real path
+        // (the route names only one NIC per subnet), not a crossed one.
+        List<Map> crossFabric = live.findAll { Map s ->
+            f.routes[s.portal] && s.viaNic && s.viaNic != f.routes[s.portal] && !HostFacts.onSubnet(s.portal as String, f.addrs[s.viaNic as String])
+        }
         List<Map> routed = live.findAll { Map s -> !f.routes[s.portal] && f.gatewayed[s.portal] }
         if (crossFabric || routed) {
             // iSCSI is never routed and never crosses fabrics: the fix logs these out (path-guarded) and deletes their records
@@ -160,8 +169,14 @@ class ComplianceChecker {
         List<Map> dead = deadIfaces(f)
         List<Map> redundant = redundantIfaces(f, spare, dead)
         Set<String> deadNames = dead*.name as Set<String>
+        Map<String, String> netdevOf = f.ifaces.collectEntries { [(it.name as String): it.netdev as String] }
         List<Map> pureNodes = f.nodes.findAll { Map n ->
-            (n['node.name'] as String)?.contains('purestorage') && !spare.any { it.is(n) } && !deadNames.contains(n['iface.iscsi_ifacename'])
+            String addr = n['node.conn[0].address'] as String
+            String nd = netdevOf[n['iface.iscsi_ifacename'] as String]
+            // only records on the portal's own fabric: one through a gateway or the other fabric's NIC must never be
+            // set to log in at boot (ISC-03b and the session guard remove exactly those sessions)
+            boolean ownFabric = f.routes[addr] && (!nd || nd == f.routes[addr] || HostFacts.onSubnet(addr, f.addrs[nd]))
+            (n['node.name'] as String)?.contains('purestorage') && !spare.any { it.is(n) } && !deadNames.contains(n['iface.iscsi_ifacename']) && ownFabric
         }
         List<Map> manual = pureNodes.findAll { it['node.startup'] != 'automatic' }
         r << new Result('ISC-04', 'node.startup = automatic for FlashArray targets', Severity.HIGH,
@@ -231,8 +246,10 @@ class ComplianceChecker {
             List<Map> ps = f.purePaths.findAll { it.wwid == m.wwid }
             List<Map> bad = ps.findAll { !(it.dmState == 'active' && it.checker == 'ready') }
             Set prios = ps*.prio as Set
-            Status st = bad ? Status.FAIL : (ps.size() < live.size() ? Status.WARN : (prios.size() > 1 ? Status.WARN : Status.PASS))
-            String note = "${ps.size() - bad.size()}/${ps.size()} healthy, sessions ${live.size()}${prios.size() > 1 ? ', mixed prio ' + prios.join('/') : ''}"
+            // sessions of ONE array (target): a LUN has a path per session to its own array, not to every linked array
+            int expect = (live.countBy { it.target }.values().min() ?: 0) as int
+            Status st = bad ? Status.FAIL : (ps.size() < expect ? Status.WARN : (prios.size() > 1 ? Status.WARN : Status.PASS))
+            String note = "${ps.size() - bad.size()}/${ps.size()} healthy, sessions ${expect}${prios.size() > 1 ? ', mixed prio ' + prios.join('/') : ''}"
             // no automatic fix: a multipath drop-in does not add missing paths or settle mixed priorities
             r << new Result('MP-08', "Paths for ${m.wwid}".toString(), Severity.HIGH, st, note.toString(),
                     'all paths active/ready, one per session, single prio group', null)

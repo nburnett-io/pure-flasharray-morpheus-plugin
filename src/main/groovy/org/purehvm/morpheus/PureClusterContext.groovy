@@ -27,7 +27,8 @@ class PureClusterContext {
     static final String CFG_LINKS = 'pureLinks'
     static final String CFG_STORAGE_SERVER = 'pureStorageServerId'   // legacy (single link)
     static final String CFG_HOST_GROUP = 'pureHostGroup'             // legacy (single link)
-    static final long SCRIPT_TIMEOUT_SEC = 900
+    /** One host script, including a whole-disk copy; the scripts that copy stop short of it (HostScripts.STILL_WAITED). */
+    static final long SCRIPT_TIMEOUT_SEC = org.purehvm.ops.HostScripts.RUNNER_TIMEOUT_SEC
 
     final MorpheusContext morpheus
     final ComputeServerGroup cluster
@@ -188,16 +189,38 @@ class PureClusterContext {
         links.find { it.storageServerId == storageServerId }
     }
 
-    private void saveLinks(List<Map> links) {
+    /**
+     * @param change turns the links AS STORED NOW into the new list. This context's own copy can be many minutes old (a
+     *        host-join job waits for the host's storage), and writing a list computed from it would drop a link added,
+     *        or a host group set, meanwhile.
+     */
+    private void saveLinks(Closure<List<Map>> change) {
         // the save writes the whole config: change a fresh copy so job history written meanwhile (JobHistory) survives
         synchronized (JobHistory.LOCK) {
             ComputeServerGroup fresh = morpheus.services.cluster.get(cluster.id) ?: cluster
+            List<Map> links = change.call(linksOf(fresh))
             [fresh, cluster].unique { System.identityHashCode(it) }.each { ComputeServerGroup c ->
                 c.setConfigProperty(CFG_LINKS, links.collect { [storageServerId: it.storageServerId, hostGroup: it.hostGroup] })
                 c.setConfigProperty(CFG_STORAGE_SERVER, null)
                 c.setConfigProperty(CFG_HOST_GROUP, null)
             }
             morpheus.services.cluster.save(fresh)
+        }
+    }
+
+    /**
+     * The cluster-id tag alone does not prove a volume is this cluster's: another appliance on the same array can have a
+     * cluster with the same id. A datastore volume of this cluster is connected only through the host group(s) this
+     * cluster is linked to (or not connected at all, after a half-finished Retire); anything else is refused.
+     */
+    void requireOwnConnections(FlashArrayClient fa, String volume) {
+        Set<String> mine = links.collect { (it.hostGroup as String)?.toLowerCase() }.findAll() as Set<String>
+        List<String> foreign = fa.listConnections([volume_names: volume])
+                .findAll { !(it.hostGroup && mine.contains((it.hostGroup as String).toLowerCase())) }
+                .collect { it.hostGroup ? "host group ${it.hostGroup}".toString() : "host ${it.host}".toString() }.unique()
+        if (foreign) {
+            throw new IllegalStateException("${volume} is connected to ${foreign.join(', ')}, which is not a host group of cluster ${cluster.name}. " +
+                    'It may belong to another Morpheus appliance using this array; refusing to touch it. If it is this cluster\'s, disconnect it there on the array first.')
         }
     }
 
@@ -238,18 +261,19 @@ class PureClusterContext {
                         'corosync clusters corrupts it.')
             }
         }
-        List<Map> ls = links.findAll { it.storageServerId != storageServerId }
-        ls << [storageServerId: storageServerId, hostGroup: hostGroup ?: link(storageServerId)?.hostGroup]
-        saveLinks(ls)
+        saveLinks { List<Map> now ->
+            String keep = now.find { it.storageServerId == storageServerId }?.hostGroup
+            now.findAll { it.storageServerId != storageServerId } + [[storageServerId: storageServerId, hostGroup: hostGroup ?: keep]]
+        }
     }
 
     /** Forget the recorded host group of a link (the planner then picks it again from the array). */
     void clearHostGroup(Long storageServerId) {
-        saveLinks(links.collect { it.storageServerId == storageServerId ? [storageServerId: it.storageServerId, hostGroup: null] : it })
+        saveLinks { List<Map> now -> now.collect { it.storageServerId == storageServerId ? [storageServerId: it.storageServerId, hostGroup: null] : it } }
     }
 
     void unlink(Long storageServerId) {
-        saveLinks(links.findAll { it.storageServerId != storageServerId })
+        saveLinks { List<Map> now -> now.findAll { it.storageServerId != storageServerId } }
     }
 
     /** Name of ANOTHER cluster linked to the same array + host group, or null. */

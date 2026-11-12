@@ -22,6 +22,43 @@ where the kernel sends each session out of the NIC on the portal's subnet, were 
   That layout cannot drift into crossed sessions. ISC-02b (sessions on "default") no longer warns in that layout.
   A host where some storage NICs are bound and others are not still fails.
 
+**Fixes from a full code audit (same release).**
+
+Restore:
+- **A long disk copy can no longer finish behind a reported failure.** Whole-VM restore is now copy, then re-check on
+  the VM's own host that it is still powered off, then a short swap. A VM started during the copy is not swapped. The
+  one-step paths (add disk, file-restore copy) stop before changing the VM if the plugin has given up waiting. The wait
+  per host script is now 60 minutes (was 15).
+- A customer whose restore cannot start because the cluster is busy is told so ("nothing was changed, try again"),
+  and the page checks for that before it creates a VM or a disk for the restore.
+- Overwrite-restore grows a disk that was resized after the restore point back to its recorded size.
+- A VM record without a libvirt id is refused instead of falling back to the VM's name.
+- Only a full file-restore copy name counts as a copy record; a disk merely labelled with the tag keeps its record.
+- Clone removes the target's replaced disks only when the target is under 2 hours old (was 24).
+
+Datastores and the array:
+- **Create never rolls back once Morpheus has been asked to make the datastore**, even if that call or the last tag
+  fails; the volume is left in place with a clear message.
+- **A volume counts as this cluster's only when it is also connected through this cluster's own host group.** The
+  cluster-id tag alone could match a cluster with the same id on another appliance sharing the array.
+- A grow that failed after the array resize is finished by asking for the same size again.
+- Link changes are computed from the links stored at that moment, so a link added during a long job survives.
+- Two nodes using the same iSCSI initiator name are a blocker in the host-group plan.
+
+Background work:
+- Snapshot indexing and the session cleanup take the cluster's job slot, so they never run beside a user's job.
+- A snapshot that cannot be opened gets an empty index after three tries instead of being cloned every pass. File
+  names the scripts would refuse no longer stop a snapshot's index from being written.
+
+Compliance and Remediate:
+- A second storage NIC in the same subnet as the portal is a real path, not a crossed session (check and cleanup).
+- The packages fix installs only what is missing (`--no-upgrade`): it no longer upgrades open-iscsi or
+  multipath-tools on a live host.
+- The node-startup fix and ISC-04 leave records that are not on the portal's own fabric alone.
+- The session fix on non-hvmcli hosts discovers with `-o new`, so existing records keep their settings.
+- With several linked arrays: MP-08 counts sessions per array, and ISC-01 needs the host on every array.
+- ARP settings are read from /proc and written in slash form, so VLAN NIC names with a dot work.
+
 ## 0.14.0 (2026-11-12)
 
 **Storage MTU per cluster: choose 1500 or 9000, check it, apply it.**

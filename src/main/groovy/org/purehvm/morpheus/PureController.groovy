@@ -864,8 +864,9 @@ class PureController implements PluginController {
     /** VMs of this cluster ([serverId, name, domain, host, power]); the libvirt domain is the server's externalId. */
     private static List<Map> clusterVms(PureClusterContext ctx) {
         Map<Long, String> hostById = ctx.hosts.collectEntries { [(it.id): it.name] }
-        ctx.vms.collect { ComputeServer s ->
-            [serverId: s.id, name: s.name, domain: s.externalId ?: s.name, host: hostById[s.parentServer.id], power: s.powerState?.toString()]
+        // a record with no libvirt id is skipped: its NAME must never stand in for a domain (it can match another VM's)
+        ctx.vms.findAll { it.externalId }.collect { ComputeServer s ->
+            [serverId: s.id, name: s.name, domain: s.externalId, host: hostById[s.parentServer.id], power: s.powerState?.toString()]
         }
     }
 
@@ -994,7 +995,8 @@ class PureController implements PluginController {
                 }
                 vr.restorePoints(t, fa, info)
             }
-            ok(t.toView() + [points: points.take(SnapshotIndex.MAX_POINTS), schedule: schedule, copies: info?.copies, network: VmRestore.networkState(info?.nics as List<Map>),
+            // busy: the page asks again before it creates a VM or a disk for a restore that could not start
+            ok(t.toView() + [busy: Jobs.busy(t.ctx.cluster.id), points: points.take(SnapshotIndex.MAX_POINTS), schedule: schedule, copies: info?.copies, network: VmRestore.networkState(info?.nics as List<Map>),
                              copyHours: [default: vr.copyHours, max: FileRestoreCopies.maxHours(s)]])
         }
     }
@@ -1008,8 +1010,20 @@ class PureController implements PluginController {
         User who = m.user
         String ref = UUID.randomUUID().toString().take(8)
         Map audited = details + [ref: ref]
+        Jobs.Job job
+        try {
+            job = startVmJobWork(kind, t, who, ref, audited, instanceIds, user(m), work)
+        } catch (Jobs.BusyException busy) {
+            // nothing was started or changed: say so, instead of the generic "restore did not complete" text
+            throw new VmRestore.PublicError('Another storage operation is running on this cluster right now. Nothing was changed; try again in a few minutes.')
+        }
         Audit.info(morpheus, who, t.ctx.cluster, "${kind} started", audited)
-        vmJobOk(Jobs.start(kind, t.ctx.cluster.id, user(m), [instanceIds: instanceIds]) { List<String> progress ->
+        vmJobOk(job)
+    }
+
+    private Jobs.Job startVmJobWork(String kind, VmRestore.Target t, User who, String ref, Map audited, List<Long> instanceIds, String userName,
+                                    Closure<Object> work) {
+        (Jobs.start(kind, t.ctx.cluster.id, userName, [instanceIds: instanceIds]) { List<String> progress ->
             VmRestore vr = new VmRestore(morpheus, progress)
             try {
                 Object r = t.ctx.withArray(t.array.storageServerId as Long) { FlashArrayClient fa -> work.call(vr, fa) }
@@ -1399,5 +1413,6 @@ class PureController implements PluginController {
         if (!PureNames.ownedBy(fa.volumeTags(vol), ctx.cluster.id)) {
             throw new IllegalArgumentException("${vol} is not a datastore volume of cluster ${ctx.cluster.name} on this array")
         }
+        ctx.requireOwnConnections(fa, vol)
     }
 }
