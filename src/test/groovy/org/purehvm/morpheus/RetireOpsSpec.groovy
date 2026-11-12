@@ -85,6 +85,26 @@ class RetireOpsSpec extends Specification {
         !s.unknown
     }
 
+    def 'a volume record is stale only when no server holds it and its file is provably absent'() {
+        given:
+        List<Map> orphans = [
+                [volumeId: 1L, name: 'gone', path: 'aaaaaaaa-1111-4222-8333-444444444444'],
+                [volumeId: 2L, name: 'held', path: 'bbbbbbbb-1111-4222-8333-444444444444'],
+                [volumeId: 3L, name: 'present', path: 'vm1/hvm_1-disk-0-abc'],
+                [volumeId: 4L, name: 'dir', path: 'vm2'],
+                [volumeId: 5L, name: 'moved', path: 'vm3/move-cccccccc-1111-4222-8333-444444444444'],
+                [volumeId: 6L, name: 'nopath', path: null],
+                [volumeId: 7L, name: 'backing', path: 'dddddddd-1111-4222-8333-444444444444', backs: ['other-ds']],
+        ]
+        Map files = [mounted: true, truncated: false, files: [[path: 'vm1/hvm_1-disk-0-abc'], [path: 'vm2/disk.qcow2'], [path: 'mvm-hb/x/hb.properties']]]
+
+        expect:
+        RetireOps.staleVolumes(orphans, files, [2L])*.volumeId == [1L, 5L, 6L]
+        // no proof without a complete listing of a mounted filesystem
+        RetireOps.staleVolumes(orphans, [mounted: false, files: []], []) == []
+        RetireOps.staleVolumes(orphans, files + [truncated: true], []) == []
+    }
+
     def 'file listing parses paths containing a pipe and is read-only'() {
         given:
         HostRunner.Result r = new HostRunner.Result(0, 'MOUNTED=1\nCOUNT=2\nFILE=a/disk|1024\nFILE=odd|name|7\n')
@@ -94,6 +114,21 @@ class RetireOpsSpec extends Specification {
         HostScripts.listFiles('/mnt/bbbbbbbb-2222-4333-8444-555555555555').with { s ->
             s.contains('mountpoint -q') && s.contains('-xdev') && s.contains('lost+found') && !(s =~ /\brm\b|umount|mkfs|>\s*\//)
         }
+    }
+
+    def 'mount-holder check is read-only, skips unmounted paths and refuses unsafe ones'() {
+        when:
+        String s = HostScripts.mountHolders('/mnt/bbbbbbbb-2222-4333-8444-555555555555')
+
+        then:
+        s.contains('mountpoint -q') && s.contains('MOUNTED=0') && s.contains('fuser -m') && s.contains('HOLDER=')
+        !(s =~ /\bkill\b|\brm\b|umount|mkfs/)
+
+        when:
+        HostScripts.mountHolders('/mnt/x; rm -rf /')
+
+        then:
+        thrown(IllegalArgumentException)
     }
 
     def 'file listing refuses an unsafe mount path'() {

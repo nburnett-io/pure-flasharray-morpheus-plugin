@@ -107,6 +107,11 @@ class ApiContractSpec extends Specification {
         ['volumes', 'powerState', 'parentServer'].every { hasProperty(ComputeServer, it) }
         ['datastore', 'externalId', 'maxStorage', 'usedStorage', 'rootVolume', 'name'].every { hasProperty(com.morpheusdata.model.StorageVolume, it) }
         ['active', 'online', 'freeSpace', 'storageSize', 'heartbeatTarget', 'refType', 'refId', 'externalPath'].every { hasProperty(Datastore, it) }
+        // Retire override: image target flag, stale volume record removal
+        hasProperty(Datastore, 'defaultStore')
+        ['get', 'remove'].every { hasMethod(MorpheusServices.getMethod('getStorageVolume').returnType, it, 1) }
+        hasProperty(com.morpheusdata.model.StorageVolume, 'id')
+        hasProperty(Datastore, 'storageVolume')
     }
 
     def 'option input types used by the plugin exist'() {

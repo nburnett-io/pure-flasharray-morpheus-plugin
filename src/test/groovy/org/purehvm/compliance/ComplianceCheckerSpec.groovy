@@ -325,6 +325,33 @@ overrides|no_path_retry|queue
         results.find { it.id == 'NET-02' && it.title.contains('192.0.2.10') }.hint == null
     }
 
+    def 'a cluster at storage MTU 1500 expects 1500, skips the jumbo ping and checks the hvmcli records'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text +
+                '\n') // the sample has no virtswitch section: add records by hand
+        f.mtu['ens2f0.60'] = 1500
+        f.mtu['ens2f1.62'] = 1500
+        f.virtswitches = [[name: 'iSCSI-60', type: 'iscsi', mtu: 1500, interfaces: ['ens2f0.60']],
+                          [name: 'iSCSI-62', type: 'iscsi', mtu: 9000, interfaces: ['ens2f1.62']],
+                          [name: 'vs0', type: 'general', mtu: 1500, interfaces: ['mgmt']]]
+        Context c = new Context(ctx.portals, ctx.registeredIqns, ctx.purityVersion)
+        c.storageMtu = 1500
+        List<ComplianceChecker.Result> rs = new ComplianceChecker().check(f, c)
+
+        expect:
+        rs.findAll { it.id == 'NET-01' }*.status as Set == [Status.PASS] as Set
+        !rs.any { it.id == 'NET-02' }
+        rs.findAll { it.id == 'NET-06' }.collectEntries { [(it.title), it.status] } ==
+                ['hvmcli MTU of virtSwitch iSCSI-60': Status.PASS, 'hvmcli MTU of virtSwitch iSCSI-62': Status.FAIL]
+        rs.find { it.id == 'NET-06' && it.status == Status.FAIL }.hint.contains('--mtu 1500')
+    }
+
+    def 'the probe reads hvmcli virtSwitch records'() {
+        expect:
+        HostFacts.parse('@@virtswitch\niSCSI-60|iscsi|9000|ens1f1.60\nvs0|general|1500|hvmup0.10,hvmup0\n@@end\n').virtswitches ==
+                [[name: 'iSCSI-60', type: 'iscsi', mtu: 9000, interfaces: ['ens1f1.60']], [name: 'vs0', type: 'general', mtu: 1500, interfaces: ['hvmup0.10', 'hvmup0']]]
+    }
+
     def 'jumbo ping failing with host MTU 9000 blames the switch'() {
         given:
         def f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)

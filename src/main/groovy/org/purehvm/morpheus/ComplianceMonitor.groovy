@@ -79,7 +79,7 @@ class ComplianceMonitor {
     static List<Map> check(PureClusterContext ctx, String only = null, Map settings = [:]) {
         Map info = arrayFacts(ctx)
         ComplianceChecker.Context cc = new ComplianceChecker.Context(info.portals as List<String>, info.iqns as Set<String>, info.purity as String,
-                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings))
+                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings), ctx.storageMtu)
         ctx.onAllHosts(probe(info.portals as List<String>), only ? [only] : ctx.hostNames).collect { String h, HostRunner.Result res ->
             hostView(h, res, cc)
         }
@@ -167,7 +167,11 @@ class ComplianceMonitor {
 
     /** Creates, replaces or clears this plugin's alarm on one host (an unchanged alarm is left as it is). */
     static void setAlarm(MorpheusContext morpheus, PureClusterContext ctx, ComputeServer host, Map alarm) {
-        String uid = uniqueId(host.id)
+        setHostAlarm(morpheus, ctx.cluster.owner, host, uniqueId(host.id), CATEGORY, "Pure FlashArray compliance: ${host.name}".toString(), alarm)
+    }
+
+    /** Creates, replaces or clears one of this plugin's alarms on a host, identified by {@code uid}. */
+    static void setHostAlarm(MorpheusContext morpheus, com.morpheusdata.model.Account owner, ComputeServer host, String uid, String category, String name, Map alarm) {
         try {
             MorpheusSession.run(morpheus) {
                 List<OperationNotification> open = morpheus.services.operationNotification.list(new DataQuery().withFilter('uniqueId', uid))
@@ -178,16 +182,16 @@ class ComplianceMonitor {
                 open.each { morpheus.services.operationNotification.clearAlarm(it) }
                 if (alarm) {
                     def r = morpheus.services.operationNotification.createAlarm(new OperationNotification(
-                            account: ctx.cluster.owner, category: CATEGORY, eventKey: CATEGORY, uniqueId: uid, name: "Pure FlashArray compliance: ${host.name}".toString(),
+                            account: owner, category: category, eventKey: category, uniqueId: uid, name: name,
                             resourceName: host.name, refType: 'computeServer', refId: host.id, status: alarm.status as String,
                             statusMessage: alarm.message as String, startDate: new Date(), acknowledged: false, active: true))
                     if (r != null && !r.success) {
-                        log.warn("compliance alarm on ${host.name} refused: ${r.msg ?: r.errors}")
+                        log.warn("${category} alarm on ${host.name} refused: ${r.msg ?: r.errors}")
                     }
                 }
             }
         } catch (Throwable e) {
-            log.warn("compliance alarm on ${host.name} failed: ${e.message}", e)
+            log.warn("${category} alarm on ${host.name} failed: ${e.message}", e)
         }
     }
 }

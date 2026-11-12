@@ -1,5 +1,122 @@
 # Changelog
 
+## 0.14.0 (2026-11-12)
+
+**Storage MTU per cluster: choose 1500 or 9000, check it, apply it.**
+
+Until now, compliance demanded MTU 9000 on every storage interface, and the plugin never changed MTU. A cluster whose
+switches do not pass jumbo frames could not pass compliance. Hosts also drifted: hvmcli's own record of a virtSwitch said
+one MTU while the interface ran another, and Morpheus compares hosts by that record.
+
+- **New: Storage (iSCSI) MTU setting for each cluster (compliance section): 1500 or 9000, default 9000.** NET-01 expects
+  that value. NET-02 (8972-byte jumbo ping to the portals) runs only at 9000. New **NET-06** checks hvmcli's record of
+  each iSCSI virtSwitch against it.
+- **New: Preview MTU and Apply MTU for each host (Hosts section).** Apply changes the host's hvmcli iSCSI virtSwitches
+  (`hvmcli virtswitch edit --mtu`) one at a time, so one storage fabric at a time, with the VMs running on the other.
+  Before each switch it requires every FlashArray LUN to have all its paths up and at least two, and it refuses a
+  switch whose NICs another virtSwitch also uses. After each switch it checks the live MTU and, at 9000, pings every
+  portal on that fabric with 8972-byte packets that may not be fragmented. Then it waits for every path to return. Any
+  failure puts that switch back to its previous MTU and stops. Preview runs the same checks and reports what would
+  change, without changing anything.
+- Includes 0.13.11's GFS2 lock guard. The tab also lists any open lock_nolock finding at the top of the compliance
+  section.
+
+## 0.13.11 (2026-11-12)
+
+**New: alarm when a cluster GFS2 is mounted without cluster locking (lock_nolock).**
+
+Seen in the field: after a host reboot with the cluster lock manager not up, a datastore was mounted by hand with
+`lockproto=lock_nolock` on one host and left that way for a week, while the other hosts mounted it normally. Two sides
+then allocated blocks (and used journal 0) without coordinating. The result was double-allocated blocks, metadata
+errors, withdraws on every host, and lost disk files after the repair.
+
+- **GFS2 lock guard, on every sweeper pass (10 minutes).** Each host reports its mounted GFS2 filesystems from
+  `/sys/fs/gfs2` (lock table, lock protocol, mount point). A lock_nolock mount raises an **error alarm** on that host
+  (Operations > Alarms) and an audit entry. The alarm says whether another host mounts the same filesystem at the same
+  time, which means corruption is happening now. It clears by itself once the mount is gone. The plugin's own
+  single-host mounts of cloned LUNs (recovery sessions, snapshot re-sign) are excluded. Read-only on the hosts.
+
+## 0.13.10 (2026-11-12)
+
+- **Override continues into Retire.** After a successful Override the plan is re-read, and when it is clean (no
+  disks, no other volumes or files, no blockers) Retire runs by itself. The Override confirmation now lists the Retire
+  steps too, so one confirmation covers both. If the new plan is not clean, Retire waits and says why.
+- **New Retire check: something still has the datastore open on a host.** Seen in the field: an idle root login shell
+  whose current directory was inside the mount. Core unmounted the datastore on the other hosts, failed on that one,
+  and reported only "NoSuchElementException". The plan now lists such processes per host (PID, user, command) as a
+  blocker, and the delete step checks again just before deleting.
+- **Clearer error when Morpheus's datastore delete fails.** Instead of the bare exception, it names the hosts where the
+  datastore is still mounted and the processes holding it.
+
+## 0.13.9 (2026-11-12)
+
+- **Fix: Retire Override stopped with "NoSuchElementException: null" and deleted nothing.** One of the stale-looking
+  records was the backing record of a datastore (`Datastore.storageVolume`), and the database refused to delete it.
+  The first failure ended the whole run, so the remaining records were not tried either. A volume record that backs a
+  datastore is now never treated as stale, and the plan names the datastore it backs. The datastore's own backing
+  record is no longer listed as something "on" it. Each record is deleted on its own: one refusal no longer stops the
+  rest, and the result lists what was deleted, kept and refused.
+
+## 0.13.8 (2026-11-12)
+
+**Retire Override: stale volume records and Image Target.**
+
+Seen in the field: an emptied datastore could not be retired. Morpheus still had nine volume records on it that no
+server held and whose files were long gone (left over from failed moves and an earlier storage repair), so Retire
+stopped at "Morpheus still has 0 VM(s) / 9 other volume(s)". The datastore was also still an Image Target.
+
+- **New: Override button in the Retire plan.** It shows when the datastore has stale volume records or is an Image
+  Target. It deletes the stale records and clears Image Target (Morpheus's `defaultStore`), then re-plans. A record
+  counts as stale only when no server in the cloud holds it AND its file is provably absent from a complete listing of
+  the mounted filesystem. The server checks both again before deleting, rather than trusting the browser. Only
+  Morpheus database records change; no file, host or array volume is touched. Records that are held or have a file
+  stay and still stop Retire.
+- The plan marks each stale record, and reports which other datastores are still Image Targets after the clear (or
+  warns when none is).
+
+## 0.13.7 (2026-11-12)
+
+**Restore a VM whose disk file is gone.**
+
+Seen in the field: after a GFS2 filesystem repair, two powered-off VMs had lost their boot disk files while their
+Morpheus records and libvirt definitions still pointed at them. Restore VM refused every time ("live disk ... not
+found", then rolled back), although the snapshot held the disk; the way out was "restore disk as new file" and a
+manual rename.
+
+- **Fix: Restore VM (cluster tab and the customer's whole-VM / chosen-disk overwrite) writes a missing disk from the
+  snapshot.** When a disk's live file is missing, the snapshot copy is written to the exact path the VM uses, with no
+  `.pre-restore` file (there is nothing to keep). It is linked into place with `ln`, so a file that appears in the
+  meantime is never overwritten. If a later disk of the same VM fails, the written disk stays (it is better than the
+  missing file); disks that had a live file are rolled back as before. "Add as a new disk" still requires the target
+  disk to exist.
+
+## 0.13.6 (2026-11-10)
+
+**A datastore stranded by a shared host group, and a Retire that could not run.**
+
+Seen in the field: a cluster was linked to an existing host group that still held a node of a second HVM cluster.
+The new datastore LUN was connected to that group, so both clusters' hosts saw it. The hosts were then moved to a new
+group by hand on the array, and the next host join silently relinked the cluster to the new group. The LUN stayed
+behind on the old group (visible only to the other cluster's node), the datastore went offline, Unlink was rightly
+refused (the cluster still owned the volume), and Retire stayed disabled because the datastore was the cluster's HA
+heartbeat target with no other datastore to take it.
+
+- **Fix: a host group that holds another cluster's HVM host is refused.** A member with an HVM initiator name
+  (`.com.hpe:`) that is not one of this cluster's nodes (by IQN, or by name for a rebuilt node) now blocks Apply host
+  group and Create datastore, instead of being listed as a warning. Two clusters must never see the same GFS2 LUN: DLM
+  locking is per cluster. A joining host is still added (its storage is not what creates the exposure), with a warning.
+  Non-HVM members (an old ESXi host) still only warn.
+- **Fix: a host join no longer relinks the cluster.** When the cluster's hosts sit in a different group than the linked
+  one, adding a host now stops with a message instead of quietly recording the other group. Only a link without a group
+  takes the group its first host is in.
+- **Fix: Apply host group refuses to relink away from the cluster's datastores.** Changing the linked group is refused
+  while any of the cluster's datastore volumes is connected somewhere other than the new group; the message lists them
+  and where they are connected.
+- **Fix: Retire works for the cluster's only datastore.** With no disks to move and no other shared datastore, the HA
+  heartbeat / VM NVRAM flags are cleared instead of handed over (the plan says so), rather than blocking the Retire.
+- Retire's plan warns when the datastore is not mounted on any host, so only Morpheus's records could be checked.
+- Unlink's refusal points to Retire.
+
 ## 0.13.5 (2026-11-05)
 
 **Unused iSCSI records, host-group names, and most of the backlog.**

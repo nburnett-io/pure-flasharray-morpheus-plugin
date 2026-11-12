@@ -60,6 +60,8 @@ class HostGroupPlanner {
         List<String> warnings = []
         List<String> blockers = []
         List<String> strayHosts = []
+        /** Stray hosts with an HVM initiator name: another cluster's node, or one that left this cluster. Blocks the plan. */
+        List<String> foreignHvmHosts = []
         /** The group named after the cluster, when another group (an old cluster's) already has that name. */
         String nameTaken
         /** What that group would be renamed to so this cluster can have the name: <name>-old. */
@@ -221,9 +223,40 @@ class HostGroupPlanner {
         Set<String> planned = p.hosts*.arrayHost as Set<String>
         // after a rename the old group's hosts go with it: the new group starts empty
         p.strayHosts = p.renameExisting ? [] : arrayHosts.findAll { it.hostGroup == p.hostGroup && !planned.contains(it.name) }*.name.sort()
-        if (p.strayHosts) {
-            p.warnings << "Host group ${p.hostGroup} also contains ${p.strayHosts.join(', ')}, which are not in this cluster (left untouched)".toString()
+        p.foreignHvmHosts = arrayHosts.findAll { p.strayHosts.contains(it.name) && isHvmHost(it) }*.name.sort()
+        List<String> otherStrays = p.strayHosts - p.foreignHvmHosts
+        if (otherStrays) {
+            p.warnings << "Host group ${p.hostGroup} also contains ${otherStrays.join(', ')}, which are not in this cluster (left untouched)".toString()
+        }
+        if (p.foreignHvmHosts) {
+            p.blockers << foreignHvmMessage(p.hostGroup, p.foreignHvmHosts)
         }
         p
+    }
+
+    /** An array host with an HPE-generated (HVM node) initiator name. ESXi and other hosts are not. */
+    static boolean isHvmHost(ArrayHost h) {
+        (h.iqns ?: [] as List<String>).any { String q -> normalizeIqn(q).contains('.com.hpe:') }
+    }
+
+    /**
+     * HVM hosts in {@code group} that are not nodes of this cluster (matched by IQN, or named after a node: a rebuilt
+     * node whose new IQN is not on the array yet). Every LUN connected to the group reaches them too, and a GFS2 LUN
+     * seen by two clusters' hosts is one mount away from corruption: DLM locking is per cluster.
+     */
+    static List<String> foreignHvmHosts(List<ArrayHost> arrayHosts, String group, List<Node> nodes) {
+        Set<String> nodeIqns = nodes.collectMany { (it.iqns ?: [] as List<String>) + (it.previousIqns ?: [] as List<String>) }
+                .collect { normalizeIqn(it as String) } as Set<String>
+        Set<String> nodeNames = nodes.collect { arrayHostName(it.name).toLowerCase() } as Set<String>
+        arrayHosts.findAll { ArrayHost h ->
+            h.hostGroup && h.hostGroup.equalsIgnoreCase(group) && isHvmHost(h) && !nodeNames.contains(h.name.toLowerCase()) &&
+                    !h.iqns.any { nodeIqns.contains(normalizeIqn(it)) }
+        }*.name.sort()
+    }
+
+    static String foreignHvmMessage(String group, List<String> hosts) {
+        "Host group ${group} also contains HVM host(s) ${hosts.join(', ')} that are not in this cluster (another cluster's, or one that left this one). ".toString() +
+                'Every datastore LUN connected to the group would reach them too, and two clusters must never share a GFS2 LUN. ' +
+                'Remove them from the group on the array (unmount there first if they still use its datastores), or use a separate host group.'
     }
 }

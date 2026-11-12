@@ -115,6 +115,8 @@ class PureController implements PluginController {
                 Route.build('/pure-hvm/unlink', 'unlink', admin),
                 Route.build('/pure-hvm/hostgroup-apply', 'hostGroupApply', admin),
                 Route.build('/pure-hvm/remediate', 'remediate', admin),
+                Route.build('/pure-hvm/storage-mtu', 'storageMtu', admin),
+                Route.build('/pure-hvm/storage-mtu-apply', 'storageMtuApply', admin),
                 Route.build('/pure-hvm/datastore-create', 'datastoreCreate', admin),
                 Route.build('/pure-hvm/datastore-grow', 'datastoreGrow', admin),
                 Route.build('/pure-hvm/clone-datastore', 'cloneDatastore', admin),
@@ -365,6 +367,7 @@ class PureController implements PluginController {
             ok([cluster: [id: ctx.cluster.id, name: ctx.cluster.name], hosts: ctx.hostNames, linked: !links.isEmpty(), links: links,
                 experimental: experimental(), guestFreeze: ConsistentSnapshot.enabled(settings()), canAdmin: canAdmin(m.user), jobs: JobHistory.merged(Jobs.forCluster(ctx.cluster.id), ctx.cluster, 10),
                 compliance: (ComplianceMonitor.LAST[ctx.cluster.id] ?: [:]) + [everyHours: ComplianceMonitor.intervalHours(settings())],
+                storageMtu: ctx.storageMtu, gfs2LockAlarms: Gfs2LockGuard.LAST[ctx.cluster.id]?.findAll { it.value } ?: [:],
                 existing: scans ? Adoption.merge(scans).findAll { it.state != 'adopted' } : [],
                 recoveries: RecoverySessions.refresh(ctx, hours).collect { sessionView(it) }, recoveryTimeoutHours: hours])
         }
@@ -562,7 +565,7 @@ class PureController implements PluginController {
                 }
                 if (vols) {
                     throw new IllegalStateException("This cluster still has datastore volume(s) on the array: ${vols.join(', ')}. " +
-                            'Unlinking would hide them from grow, snapshots and recovery.')
+                            'Unlinking would hide them from grow, snapshots and recovery. Retire them first (Retire... on the datastore row).')
                 }
             }
             ctx.unlink(sid)
@@ -595,6 +598,16 @@ class PureController implements PluginController {
                 String other = ctx.clusterUsing(link.storageServerId as Long, plan.hostGroup)
                 if (other) {
                     throw new IllegalStateException("Host group ${plan.hostGroup} is already linked to cluster ${other}; refusing to change it")
+                }
+                String current = link.hostGroup as String
+                if (current && !current.equalsIgnoreCase(plan.hostGroup)) {
+                    Long cid = ctx.cluster.id
+                    Map<String, List<String>> stranded = ap.volumesOutside(plan.hostGroup) { Map<String, String> tags -> PureNames.ownedBy(tags, cid) }
+                    if (stranded) {
+                        throw new IllegalStateException("Refusing to relink from ${current} to ${plan.hostGroup}: this cluster's datastore volume(s) " +
+                                stranded.collect { k, v -> "${k} (connected to ${v.join(', ')})" }.join('; ') +
+                                " would stay on hosts outside ${plan.hostGroup}. Retire them first (Retire... on the datastore row), or connect them to ${plan.hostGroup} on the array.")
+                    }
                 }
                 progress.addAll(ap.apply(plan, nodes))
                 ctx.setLink(link.storageServerId as Long, plan.hostGroup)
@@ -635,12 +648,53 @@ class PureController implements PluginController {
         }
     }
 
+    /** The cluster's storage MTU (1500 or 9000): what compliance expects and Apply MTU sets. Changes nothing on the hosts. */
+    def storageMtu(ViewModel<Map> m) {
+        guarded {
+            PureClusterContext ctx = operatorCtx(m)
+            String v = p(m).mtu as String
+            if (!v?.isInteger()) {
+                throw new IllegalArgumentException('mtu is required (1500 or 9000)')
+            }
+            int before = ctx.storageMtu
+            ctx.setStorageMtu(v as Integer)
+            audit(m, ctx, 'storage MTU set', [mtu: v, before: before])
+            ok([storageMtu: ctx.storageMtu])
+        }
+    }
+
+    /** Sets the cluster's storage MTU on one host's hvmcli iSCSI virtSwitches, fabric by fabric (HostScripts.applyStorageMtu). */
+    def storageMtuApply(ViewModel<Map> m) {
+        guarded {
+            String host = p(m).host as String
+            boolean preview = flag(p(m).preview)
+            startJob(m, preview ? 'mtu-preview' : 'mtu-apply') { PureClusterContext ctx, List<String> progress ->
+                ctx.requireHost(host)
+                int mtu = ctx.storageMtu
+                List<String> portals = ComplianceMonitor.arrayFacts(ctx).portals as List<String>
+                progress << (preview ? "${host}: preview only, nothing is changed (target MTU ${mtu})"
+                        : "${host}: setting the iSCSI virtSwitches to MTU ${mtu}, one fabric at a time").toString()
+                HostRunner.Result r = ctx.runner.run(host, HostScripts.applyStorageMtu(mtu, portals, preview))
+                List<String> lines = r.output?.readLines() ?: []
+                lines.findAll { it ==~ /^(STEP|SKIP|WOULD|DONE|REVERTED|WARN|PATHS)=.*/ }.each { progress << "${host}: ${it}".toString() }
+                String err = lines.find { it.startsWith('ERROR=') }
+                if (err || !r.ok) {
+                    throw new IllegalStateException("${host}: ${err ? err.substring(6) : (r.error ?: 'the MTU script failed')}")
+                }
+                progress << "${host}: done; run Check again to see the result".toString()
+                [host: host, mtu: mtu, changed: lines.findAll { it.startsWith('DONE=') }*.substring(5)]
+            }
+        }
+    }
+
     def datastoreCreate(ViewModel<Map> m) {
         guarded {
             String name = p(m).name as String
             long bytes = bytesOf(m)
             startArrayJob(m, 'datastore-create') { PureClusterContext ctx, Map link, FlashArrayClient fa, List<String> progress ->
                 requireHostGroup(link)
+                // the new LUN reaches every member of the group: never a host of another cluster
+                new HostGroupApplier(fa).requireNoForeignHvmHosts(link.hostGroup as String, ctx.nodes)
                 progress << "array ${ctx.storageServer(link.storageServerId as Long).name}, host group ${link.hostGroup}".toString()
                 DatastoreOps.Provisioned pr = new DatastoreOps(fa, ctx.runner, ctx.hostNames, registrar(), progress)
                         .provisionGfs2(ctx.cluster.id, link.hostGroup as String, name, bytes)

@@ -35,6 +35,7 @@ class HostFacts {
     List<Map> pools = []                     // libvirt storage pools [name, target, state]
     boolean hvmcli
     Map<String, String> linkState = [:]      // interface -> operstate (empty: probe older than 0.13.2)
+    List<Map> virtswitches = []              // hvmcli virtSwitches [name, type, mtu (configured), interfaces]
     boolean complete                         // saw the @@end marker
 
     static HostFacts parse(String output) {
@@ -146,6 +147,10 @@ class HostFacts {
         split(sections.ping).each { List<String> p -> f.jumboPing[p[0]] = p[1] == 'ok' }
         split(sections.sysctl).each { List<String> p -> f.sysctl.computeIfAbsent(p[0]) { [:] }[p[1]] = p[2] }
         split(sections.netplan).each { List<String> p -> f.netplanFiles[p[0]] = p.size() > 1 ? p[1] : '' }
+        split(sections.virtswitch).each { List<String> p ->
+            f.virtswitches << [name: p[0], type: p.size() > 1 ? p[1] : '', mtu: p.size() > 2 && p[2]?.isInteger() ? p[2] as Integer : null,
+                               interfaces: p.size() > 3 ? (p[3] ?: '').tokenize(',') : []]
+        }
         sections.gfs2mounts?.findAll { it.trim() }?.each { String l ->
             List<String> p = l.trim().split(/\s+/) as List<String>
             f.gfs2Mounts << [source: p[0], target: p[1], options: p[2]]

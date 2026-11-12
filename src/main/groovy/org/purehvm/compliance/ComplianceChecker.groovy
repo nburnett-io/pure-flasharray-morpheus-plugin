@@ -38,6 +38,7 @@ class ComplianceChecker {
         String noPathRetry = '0'           // what Remediate writes: see Remediation.noPathRetrySetting
         int toleranceWarnSeconds = DEFAULT_TOLERANCE_WARN_SECONDS
         boolean allowLowerToZero = false    // "Multipath: allow lowering to 0": a setting of 0 may replace a host's finite value
+        int storageMtu = 9000               // the cluster's chosen iSCSI MTU (1500 or 9000)
     }
 
     /** Inside HVM's own storage-loss clocks: all-paths-down at about 2 minutes, host offline at 140 s. */
@@ -244,14 +245,23 @@ class ComplianceChecker {
         // ---- network
         // MTU is never remediated automatically: the change bounces every link of the host's switch (management too),
         // the plugin reaches the host over that link, and a switch path without jumbo frames black-holes the traffic
+        // the expected MTU is the cluster's choice (Storage MTU in the cluster tab); Apply MTU changes it host by host
+        int want = ctx.storageMtu
         storIfs.each { String nic ->
             Integer m = f.mtu[nic]
-            boolean ok = m == 9000
-            r << new Result('NET-01', "MTU on ${nic}".toString(), Severity.HIGH, ok ? Status.PASS : Status.FAIL, "${m}".toString(), '9000', null,
-                    ok ? null : mtuHint(nic, f.netplanFiles[nic]))
+            boolean ok = m == want
+            r << new Result('NET-01', "MTU on ${nic}".toString(), Severity.HIGH, ok ? Status.PASS : Status.FAIL, "${m}".toString(), "${want}".toString(), null,
+                    ok ? null : mtuHint(nic, f.netplanFiles[nic], want))
+        }
+        // hvmcli's own record of each iSCSI virtSwitch: Morpheus compares hosts by it, and a re-apply of the switch writes it back
+        f.virtswitches.findAll { it.type == 'iscsi' }.each { Map vs ->
+            boolean ok = vs.mtu == want
+            r << new Result('NET-06', "hvmcli MTU of virtSwitch ${vs.name}".toString(), Severity.MEDIUM, ok ? Status.PASS : Status.FAIL,
+                    "${vs.mtu}".toString(), "${want}".toString(), null,
+                    ok ? null : "Use Apply MTU on this host (cluster tab, Hosts), or: sudo hvmcli virtswitch edit --virtswitch-name ${vs.name} --mtu ${want} --force".toString())
         }
         reachable.each { String p ->
-            if (f.jumboPing.containsKey(p)) {
+            if (want == 9000 && f.jumboPing.containsKey(p)) {
                 boolean ok = f.jumboPing[p]
                 String hint = ok ? null : (f.mtu[f.routes[p]] == 9000
                         ? "This host is at MTU 9000 on ${f.routes[p]}, so a switch port (or the array port) between them does not pass jumbo frames: fix it on the switch."
@@ -402,15 +412,16 @@ class ComplianceChecker {
     }
 
     /** How to raise the MTU of a storage interface, by whoever owns the host's network config. */
-    static String mtuHint(String nic, String netplanFile) {
+    static String mtuHint(String nic, String netplanFile, int want = 9000) {
         String window = 'In a maintenance window (host in maintenance mode, no VMs): the change bounces every link on it, management included.'
         def m = netplanFile =~ /99-hvmcli-virtswitch-(.+)\.yaml$/
         if (m.find()) {
-            return "${window} The network was built with hvmcli: sudo hvmcli virtswitch edit --virtswitch-name ${m.group(1)} --mtu 9000 --force " +
-                    '(sets the uplinks, bond, bridges and VLANs). Then Rescan the host and Check again.'
+            return "${window} The network was built with hvmcli: sudo hvmcli virtswitch edit --virtswitch-name ${m.group(1)} --mtu ${want} --force " +
+                    '(sets the uplinks, bond, bridges and VLANs). Then Rescan the host and Check again. ' +
+                    'For a dedicated iSCSI virtSwitch, Apply MTU on this host (cluster tab, Hosts) does this one fabric at a time with the VMs running.'
         }
-        netplanFile ? "${window} Set mtu: 9000 on ${nic} and every interface under it (bond, uplinks, bridge) in ${netplanFile}, then sudo netplan apply. Then Rescan and Check again."
-                : "${window} Set MTU 9000 on ${nic} and every interface under it (bond, uplinks, bridge) wherever this host's network is defined."
+        netplanFile ? "${window} Set mtu: ${want} on ${nic} and every interface under it (bond, uplinks, bridge) in ${netplanFile}, then sudo netplan apply. Then Rescan and Check again."
+                : "${window} Set MTU ${want} on ${nic} and every interface under it (bond, uplinks, bridge) wherever this host's network is defined."
     }
 
     /** FlashArray node records not logged in while their portal has a session through another iface: they only add a path at the next boot. */

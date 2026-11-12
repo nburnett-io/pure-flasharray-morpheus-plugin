@@ -81,4 +81,10 @@ sec pools;    for p in $(virsh pool-list --all --name 2>/dev/null); do echo "$p|
 sec hvmcli;   command -v hvmcli 2>/dev/null
 # interface|operstate: an iSCSI iface bound to a missing or down NIC makes an unbound discovery time out
 sec linkstate; for n in /sys/class/net/*; do echo "$(basename "$n")|$(cat "$n/operstate" 2>/dev/null)"; done
+# hvmcli virtSwitches: name|base_type|configured mtu|traffic interfaces (comma list)
+sec virtswitch
+for f in /etc/hvm/virtswitch/*.yaml; do
+  [ -e "$f" ] || continue
+  awk '/^name:/ {n=$2} /^base_type:/ {t=$2} /^mtu:/ {m=$2} /^[[:space:]]+interface:/ {i=i (i?",":"") $2} END {print n "|" t "|" m "|" i}' "$f"
+done
 sec end

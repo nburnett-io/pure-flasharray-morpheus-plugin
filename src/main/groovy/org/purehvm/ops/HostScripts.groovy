@@ -604,8 +604,13 @@ rm -f "\$TM"
      * Restores ONE disk of a powered-off VM in place from the recovery mount: writes a standalone copy of the
      * snapshot-time image next to the live file, then swaps it in and keeps the live file as <dest>.pre-restore-<ts>
      * (undo = move it back). Refuses when the live disk has a backing chain (the VM has Morpheus snapshots).
+     *
+     * allowMissing: the live file is gone (seen 2026-11: a GFS2 repair dropped VM disk files, the VMs' records and
+     * libvirt definitions stayed). The snapshot copy is then written into the empty slot: MISSING=1 and no KEPT, since
+     * there is nothing to keep. The copy is linked into place with ln, so a file that appears meanwhile is never
+     * overwritten. Without it the missing file is an error, as for "add as a new disk" (the target must exist).
      */
-    static String restoreVmDisk(String source, String recoveryMount, String prodMount, String dest, String ts) {
+    static String restoreVmDisk(String source, String recoveryMount, String prodMount, String dest, String ts, boolean allowMissing = false) {
         [source, recoveryMount, prodMount, dest].each { requireSafePath(it) }
         if (!(ts ==~ /[0-9]{8,14}/)) {
             throw new IllegalArgumentException('bad timestamp')
@@ -614,14 +619,29 @@ rm -f "\$TM"
             throw new IllegalArgumentException('source must be inside the recovery mount and dest inside the production mount')
         }
         HEADER + SNAP_CONVERT + """SRC='${source}'; RMP='${recoveryMount}'; PMP='${prodMount}'; DEST='${dest}'; KEEP="\$DEST.pre-restore-${ts}"; TMP="\$DEST.restore-tmp"
-[ -e "\$DEST" ] || { echo "ERROR=live disk \$DEST not found"; exit 2; }
+MISSING=''
+if [ ! -e "\$DEST" ]; then
+  [ '${allowMissing ? 1 : 0}' = 1 ] || { echo "ERROR=live disk \$DEST not found"; exit 2; }
+  MISSING=1
+fi
 [ -e "\$SRC" ] || { echo "ERROR=disk not present in the snapshot"; exit 2; }
-[ -z "\$(backing "\$DEST")" ] || { echo "ERROR=VM has snapshots (live disk has a backing chain); delete them or restore as files"; exit 3; }
-OWN=\$(stat -c %u:%g "\$DEST"); MODE=\$(stat -c %a "\$DEST")
+if [ -z "\$MISSING" ]; then
+  [ -z "\$(backing "\$DEST")" ] || { echo "ERROR=VM has snapshots (live disk has a backing chain); delete them or restore as files"; exit 3; }
+  OWN=\$(stat -c %u:%g "\$DEST"); MODE=\$(stat -c %a "\$DEST")
+else
+  D=\$(dirname "\$DEST"); mkdir -p "\$D" || { echo "ERROR=cannot create \$D"; exit 2; }
+  OWN=\$(stat -c %u:%g "\$D"); MODE=644
+fi
 snapconvert "\$SRC" "\$TMP"
-mv "\$DEST" "\$KEEP" && mv "\$TMP" "\$DEST" || { [ -e "\$KEEP" ] && [ ! -e "\$DEST" ] && mv "\$KEEP" "\$DEST"; echo "ERROR=swap failed"; exit 8; }
+if [ -n "\$MISSING" ]; then
+  ln "\$TMP" "\$DEST" || { rm -f "\$TMP"; echo "ERROR=\$DEST appeared while restoring; nothing replaced"; exit 8; }
+  rm -f "\$TMP"
+  echo "MISSING=1"
+else
+  mv "\$DEST" "\$KEEP" && mv "\$TMP" "\$DEST" || { [ -e "\$KEEP" ] && [ ! -e "\$DEST" ] && mv "\$KEEP" "\$DEST"; echo "ERROR=swap failed"; exit 8; }
+  echo "KEPT=\$KEEP"
+fi
 chown "\$OWN" "\$DEST"; chmod "\$MODE" "\$DEST"
-echo "KEPT=\$KEEP"
 echo "SIZE=\$(stat -c %s "\$DEST")"
 """
     }
@@ -844,6 +864,96 @@ echo "COUNT=\$(find "\$MP" -xdev -path "\$MP/lost+found" -prune -o -type f -prin
 find "\$MP" -xdev -path "\$MP/lost+found" -prune -o -type f -printf 'FILE=%P|%s\\n' 2>/dev/null | head -${LIST_FILES_MAX}
 # head closing early SIGPIPEs find once the listing is long; without this the script "fails" and Retire would read
 # a full datastore as unreadable
+true
+"""
+    }
+
+    /**
+     * Sets the MTU of every hvmcli iSCSI virtSwitch on this host, one switch (= one storage fabric) at a time, so the
+     * other fabric carries the LUNs meanwhile. Per switch: refuse unless every FlashArray map has all paths up and at
+     * least two; refuse a switch whose NICs another virtSwitch also uses (management would bounce); hvmcli edit; check
+     * the live MTU; at 9000 an 8972-byte DF ping to each portal on that fabric; wait until every path is back. Any
+     * failure puts that switch back to its previous MTU and stops before the next one.
+     * Output: SKIP=<switch>|<why>, DONE=<switch>|<old>|<new>, REVERTED=<switch>|<old>, ERROR=...
+     */
+    static String applyStorageMtu(int mtu, List<String> portals, boolean dryRun = false) {
+        if (!(mtu in [1500, 9000])) {
+            throw new IllegalArgumentException("MTU must be 1500 or 9000")
+        }
+        portals.each { if (!(it ==~ /[0-9a-fA-F.:]+/)) { throw new IllegalArgumentException("not a portal address: ${it}") } }
+        HEADER + """MTU=${mtu}
+PORTALS="${portals.join(' ')}"
+DRY=${dryRun ? 1 : 0}
+""" + '''command -v hvmcli >/dev/null || { echo "ERROR=hvmcli not found: this host's network is not managed by hvmcli"; exit 2; }
+ls /etc/hvm/virtswitch/*.yaml >/dev/null 2>&1 || { echo "ERROR=no hvmcli virtSwitch definitions on this host"; exit 2; }
+yv() { awk -v k="$1" '$1 == k":" {print $2; exit}' "$2"; }
+# maps|maps missing a path|maps with fewer than 2 active paths (FlashArray maps only)
+paths() { multipathd show paths raw format "%w|%t|%T" 2>/dev/null | awk -F'|' '$1 ~ /^3624a937/ {n[$1]++; if ($2 == "active" && $3 == "ready") a[$1]++}
+  END {t=0; b=0; f=0; for (w in n) {t++; if (a[w] < n[w]) b++; if (a[w] < 2) f++}; print t "|" b "|" f}'; }
+wait_paths() { local i s; for i in $(seq 1 24); do s=$(paths); [ "$(echo "$s" | cut -d'|' -f2)" = 0 ] && return 0; sleep 5; done; echo "WARN=paths still incomplete after 120 s: $s"; return 1; }
+live_ok() { local i; for i in $DEVS; do [ "$(cat /sys/class/net/$i/mtu 2>/dev/null)" = "$1" ] || return 1; done; }
+jumbo_ok() { local p d n=0; for p in $PORTALS; do d=$(ip -o route get "$p" 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p')
+    case " $DEVS " in *" $d "*) n=$((n+1)); ping -c3 -W2 -M do -s 8972 "$p" >/dev/null 2>&1 || { echo "WARN=8972-byte DF ping to $p via $d failed"; return 1; };; esac; done
+  [ "$n" -gt 0 ] || echo "WARN=no array portal routes through $DEVS: jumbo frames not verified"; return 0; }
+edit() { hvmcli virtswitch edit --virtswitch-name "$1" --mtu "$2" --force >/tmp/pure-mtu.out 2>&1; }
+for F in /etc/hvm/virtswitch/*.yaml; do
+  [ "$(yv base_type "$F")" = iscsi ] || continue
+  N=$(yv name "$F"); OLD=$(yv mtu "$F"); OLD=${OLD:-1500}
+  BR=$(yv bridge_name "$F")
+  DEVS="$(awk '$1 == "interface:" {print $2}' "$F") $(awk -v b="$BR" '$1 == "vlanid:" && b != "" {print b "." $2}' "$F")"
+  DEVS=$(for i in $DEVS; do [ -e /sys/class/net/$i ] && echo $i; done | tr '\\n' ' ')
+  if [ "$OLD" = "$MTU" ] && live_ok "$MTU"; then echo "SKIP=$N|already $MTU"; continue; fi
+  BASE=$(awk '/^base_interface:/ {b=1; next} b && /^[[:space:]]*- / {print $2; next} {b=0}' "$F")
+  for O in /etc/hvm/virtswitch/*.yaml; do [ "$O" = "$F" ] && continue
+    for i in $BASE; do awk '/^base_interface:/ {b=1; next} b && /^[[:space:]]*- / {print $2; next} {b=0}' "$O" | grep -qx "$i" && { echo "ERROR=$N shares NIC $i with virtSwitch $(yv name "$O"): changing its MTU would bounce that switch too; do it in a maintenance window by hand"; exit 3; }; done
+  done
+  S=$(paths)
+  [ "$(echo "$S" | cut -d'|' -f2)" = 0 ] && [ "$(echo "$S" | cut -d'|' -f3)" = 0 ] || { echo "ERROR=before $N: FlashArray paths not all up or a LUN has fewer than 2 (maps|missing a path|under 2 = $S); nothing changed on $N"; exit 4; }
+  if [ "$DRY" = 1 ]; then echo "WOULD=$N|configured $OLD, live $(for i in $DEVS; do echo -n "$i=$(cat /sys/class/net/$i/mtu) "; done)-> $MTU"; continue; fi
+  echo "STEP=$N|$OLD -> $MTU on $DEVS"
+  if ! edit "$N" "$MTU"; then echo "ERROR=hvmcli edit of $N failed: $(tail -3 /tmp/pure-mtu.out | tr '\\n' ' ')"; edit "$N" "$OLD"; wait_paths; echo "REVERTED=$N|$OLD"; exit 5; fi
+  sleep 5
+  FAIL=""
+  live_ok "$MTU" || FAIL="live MTU is not $MTU on $DEVS"
+  [ -z "$FAIL" ] && [ "$MTU" = 9000 ] && { jumbo_ok || FAIL="jumbo frames do not pass end to end (switch or array port at 1500?)"; }
+  [ -z "$FAIL" ] && { wait_paths || FAIL="FlashArray paths did not all come back"; }
+  if [ -n "$FAIL" ]; then
+    echo "ERROR=$N: $FAIL; putting it back to $OLD"; edit "$N" "$OLD"; sleep 5; wait_paths; echo "REVERTED=$N|$OLD"; exit 6
+  fi
+  echo "DONE=$N|$OLD|$MTU"
+done
+echo "PATHS=$(paths)"
+'''
+    }
+
+    /**
+     * Read-only: every mounted GFS2 with its lock table, lock protocol (lock_dlm / lock_nolock) and mount point, from
+     * sysfs (the kernel's own view, whatever the mount options said): GFS2=<lock table>|<protocol>|<mount point>.
+     */
+    static String gfs2Locks() {
+        HEADER + '''for d in /sys/fs/gfs2/*/; do
+  [ -d "$d" ] || continue
+  t=$(basename "$d"); p=$(cat "$d/lock_module/proto_name" 2>/dev/null); id=$(cat "$d/id" 2>/dev/null)
+  mp=$(awk -v id="$id" '$3==id {print $5; exit}' /proc/self/mountinfo)
+  echo "GFS2=$t|$p|$mp"
+done
+true
+'''
+    }
+
+    /**
+     * Read-only: processes that would make an unmount of the mount point fail ("target is busy"), e.g. a login shell
+     * whose working directory is inside it. HOLDER=<pid>|<user>|<command> each; MOUNTED=0 when nothing is mounted.
+     */
+    static String mountHolders(String mountPoint) {
+        requireSafePath(mountPoint)
+        HEADER + """MP='${mountPoint}'
+mountpoint -q "\$MP" || { echo "MOUNTED=0"; exit 0; }
+echo "MOUNTED=1"
+for p in \$(fuser -m "\$MP" 2>/dev/null); do
+  p=\${p%%[!0-9]*}; [ -n "\$p" ] || continue
+  echo "HOLDER=\$p|\$(ps -o user= -p "\$p" 2>/dev/null | tr -d ' ')|\$(ps -o args= -p "\$p" 2>/dev/null | cut -c1-80)"
+done
 true
 """
     }

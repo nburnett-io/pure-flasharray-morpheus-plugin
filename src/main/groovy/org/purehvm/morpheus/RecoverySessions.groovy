@@ -245,6 +245,12 @@ class RecoverySessions {
             // one cluster's failure (an array answering 503 during an upgrade) must not skip every cluster after it
             try {
                 PureClusterContext ctx = new PureClusterContext(morpheus, c.id)
+                // first: the slower passes below must not delay the corruption guard
+                try {
+                    Gfs2LockGuard.run(morpheus, ctx)
+                } catch (Exception e) {
+                    log.warn("GFS2 lock guard on ${c.name} failed: ${e.message}", e)
+                }
                 try {
                     closeExpired(morpheus, ctx, c, refresh(ctx, hours).findAll { it.expires && it.expires < now })
                 } catch (Exception e) {

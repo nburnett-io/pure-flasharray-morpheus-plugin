@@ -89,7 +89,7 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
         Collection<String> chosen = fixes
         if (chosen == null) {
             ComplianceChecker.Context cc = new ComplianceChecker.Context(portals, info.iqns as Set<String>, info.purity as String, retry,
-                    ComplianceMonitor.toleranceWarnSeconds(settings), ComplianceMonitor.allowZero(settings))
+                    ComplianceMonitor.toleranceWarnSeconds(settings), ComplianceMonitor.allowZero(settings), ctx.storageMtu)
             chosen = new ComplianceChecker().check(f, cc).findAll { it.status == ComplianceChecker.Status.FAIL && it.fix in ON_JOIN }*.fix.unique()
         }
         if (!chosen) {

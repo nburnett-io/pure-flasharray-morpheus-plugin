@@ -119,6 +119,38 @@ class HostGroupPlannerSpec extends Specification {
         !p.hosts*.arrayHost.contains('old-node')
     }
 
+    def 'an HVM host of another cluster in the group BLOCKS the plan: a LUN connected there would reach both clusters'() {
+        given: 'cluster-b reuses a group that still holds cluster-a\'s node hvm-node09'
+        def hosts = nodes.collect { new ArrayHost(it.name.tokenize('.')[0], it.iqns, 'hg', 0) } +
+                [new ArrayHost('hvm-node09', ['iqn.2026-09.com.hpe:hvm-node09:7367'], 'hg', 0),
+                 new ArrayHost('esx01', ['iqn.1998-01.com.vmware:esx01'], 'hg', 0)]
+
+        when:
+        def p = planner.plan('cluster-b', nodes, hosts, ['hg'], 'hg')
+
+        then:
+        p.blocked
+        p.foreignHvmHosts == ['hvm-node09']
+        p.blockers.any { it.contains('hvm-node09') && it.contains('never share a GFS2 LUN') }
+        p.warnings.any { it.contains('esx01') }          // a non-HVM stray still only warns
+        p.strayHosts == ['esx01', 'hvm-node09']
+    }
+
+    def 'foreignHvmHosts ignores this cluster\'s nodes, a rebuilt node\'s same-named host, other groups and non-HVM hosts'() {
+        given:
+        def hosts = [
+                new ArrayHost('hvm01', nodes[0].iqns, 'hg', 0),                                        // a node, by IQN
+                new ArrayHost('HVM02', ['iqn.2024-12.com.hpe:hvm02:old'], 'hg', 0),                     // rebuilt node, by name
+                new ArrayHost('hvm-node09', ['iqn.2026-09.com.hpe:hvm-node09:1'], 'hg', 0),             // foreign
+                new ArrayHost('hvm-node10', ['iqn.2026-09.com.hpe:hvm-node10:1'], 'other-hg', 0),       // other group
+                new ArrayHost('esx01', ['iqn.1998-01.com.vmware:esx01'], 'hg', 0),                      // not HVM
+        ]
+
+        expect:
+        HostGroupPlanner.foreignHvmHosts(hosts, 'HG', nodes) == ['hvm-node09']
+        HostGroupPlanner.foreignHvmHosts(hosts, 'empty-hg', nodes).isEmpty()
+    }
+
     // hvm-node03, 2026-10-21: rebuilt with a new initiator name; the array host named after it still has the old IQN
     static final String NEW_IQN = 'iqn.2026-10.com.hpe:hvm-node03:5947'
     static final String OLD_IQN = 'iqn.2024-12.com.hpe:hvm-node03:36307'

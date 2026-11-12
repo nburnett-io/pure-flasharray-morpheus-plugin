@@ -207,15 +207,22 @@ class RecoveryOps {
         List<Map> done = []
         try {
             (vm.disks as List<Map>).each { Map d ->
-                HostRunner.Result r = runner.run(s.host, HostScripts.restoreVmDisk(d.snapPath as String, s.mount, prodMount, d.path as String, ts))
+                // a missing live file is restored too: the VM's record and definition still point at it (GFS2 repair)
+                HostRunner.Result r = runner.run(s.host, HostScripts.restoreVmDisk(d.snapPath as String, s.mount, prodMount, d.path as String, ts, true))
                 if (!r.ok) {
                     throw new IllegalStateException("${d.target}: ${r.error}")
                 }
                 done << [target: d.target, path: d.path, kept: r.kv.KEPT, size: r.kv.SIZE]
-                step("${vm.name} ${d.target}: restored from ${s.snapshot}; previous disk kept as ${r.kv.KEPT}")
+                step(r.kv.MISSING ? "${vm.name} ${d.target}: its disk file ${d.path} was missing; written from ${s.snapshot}".toString()
+                        : "${vm.name} ${d.target}: restored from ${s.snapshot}; previous disk kept as ${r.kv.KEPT}".toString())
             }
         } catch (Exception e) {
             done.reverseEach { Map d ->
+                if (!d.kept) {
+                    // the live file was missing before: the snapshot copy is better than nothing, so it stays
+                    step("kept the restored ${d.target} (${d.path}): its disk file was missing before the restore".toString())
+                    return
+                }
                 HostRunner.Result u = runner.run(s.host, HostScripts.undoRestoreVmDisk(d.path as String, d.kept as String))
                 step(u.ok ? "rolled back ${d.target}".toString() : "ROLLBACK FAILED for ${d.target}: ${u.error} (previous disk is ${d.kept})".toString())
             }

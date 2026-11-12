@@ -20,13 +20,38 @@ class HostGroupApplier {
     }
 
     Plan plan(String clusterName, List<Node> nodes, String preferredGroupName = null, boolean renameTaken = false) {
-        List<Map> hosts = fa.listHosts()
+        planner.plan(clusterName, nodes, arrayHosts(), fa.listHostGroups()*.name as List<String>, preferredGroupName, renameTaken)
+    }
+
+    private List<ArrayHost> arrayHosts() {
         List<Map> privateConns = fa.listConnections([:]).findAll { it.host && !it.hostGroup }
         Map<String, Integer> privateCount = privateConns.countBy { it.host as String }
-        List<ArrayHost> arrayHosts = hosts.collect { Map h ->
+        fa.listHosts().collect { Map h ->
             new ArrayHost(h.name as String, (h.iqns ?: []) as List<String>, (h.host_group as Map)?.name as String, privateCount[h.name as String] ?: 0)
         }
-        planner.plan(clusterName, nodes, arrayHosts, fa.listHostGroups()*.name as List<String>, preferredGroupName, renameTaken)
+    }
+
+    /** Refuses when the group holds HVM hosts that are not this cluster's nodes (see HostGroupPlanner.foreignHvmHosts). */
+    void requireNoForeignHvmHosts(String group, List<Node> nodes) {
+        List<String> foreign = HostGroupPlanner.foreignHvmHosts(arrayHosts(), group, nodes)
+        if (foreign) {
+            throw new IllegalStateException(HostGroupPlanner.foreignHvmMessage(group, foreign))
+        }
+    }
+
+    /**
+     * This cluster's datastore volumes (plugin tags) that are connected anywhere other than through {@code group}:
+     * volume -> where ("host group X" / "host Y"). Relinking the cluster to {@code group} would strand them on hosts
+     * that are no longer the cluster's, so the plugin could never unmount, grow or retire them cleanly.
+     */
+    Map<String, List<String>> volumesOutside(String group, Closure<Boolean> ownedByCluster) {
+        Set<String> owned = fa.tagsByVolume().findAll { k, v -> ownedByCluster(v) }*.key as Set<String>
+        Map<String, List<String>> out = [:]
+        fa.listConnections([:]).findAll { owned.contains(it.volume as String) && !(it.hostGroup as String)?.equalsIgnoreCase(group) }.each { Map c ->
+            out.computeIfAbsent(c.volume as String) { [] } << (c.hostGroup ? "host group ${c.hostGroup}" : "host ${c.host}").toString()
+        }
+        out.values().each { it.unique() }   // in place
+        out
     }
 
     /** Applies a plan that is not blocked. Returns a log of what was done. */

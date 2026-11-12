@@ -207,6 +207,40 @@ class OpsSpec extends Specification {
         !s.contains('rm -f "$DEST"')
     }
 
+    def 'a missing live disk is written into the empty slot only when allowed, and never over a file that appears meanwhile'() {
+        when:
+        def allowed = HostScripts.restoreVmDisk('/mnt/pure-recover-a/vm1/root.qcow2', '/mnt/pure-recover-a', '/mnt/prod', '/mnt/prod/vm1/root.qcow2', '20261112120000', true)
+        def strict = HostScripts.restoreVmDisk('/mnt/pure-recover-a/vm1/root.qcow2', '/mnt/pure-recover-a', '/mnt/prod', '/mnt/prod/vm1/root.qcow2', '20261112120000')
+
+        then:
+        allowed.contains("[ '1' = 1 ] || { echo \"ERROR=live disk")
+        strict.contains("[ '0' = 1 ] || { echo \"ERROR=live disk")
+        allowed.contains('ln "$TMP" "$DEST" ||')          // ln refuses an existing target; mv would clobber it
+        allowed.contains('echo "MISSING=1"')
+    }
+
+    def 'restore in place writes a missing disk, and a later failure keeps it instead of rolling it back'() {
+        given:
+        int n = 0
+        def r = runner([
+                'UNDONE=': { h -> new HostRunner.Result(0, 'UNDONE=x') },
+                'KEEP='  : { h -> n++ == 0 ? new HostRunner.Result(0, 'MISSING=1\nSIZE=1') : new HostRunner.Result(4, 'ERROR=convert failed') },
+        ])
+        def progress = []
+        def vm = [name: 'vm1', serverId: 7L, domainState: 'shut off', restorable: true, disks: [
+                [target: 'vda', path: '/mnt/prod/vm1/root.qcow2', snapPath: '/mnt/pure-recover-abc123/vm1/root.qcow2'],
+                [target: 'vdb', path: '/mnt/prod/vm1/data.qcow2', snapPath: '/mnt/pure-recover-abc123/vm1/data.qcow2']]]
+
+        when:
+        new RecoveryOps(fa, r, progress).restoreVmInPlace(session(), '/mnt/prod', vm)
+
+        then:
+        thrown(IllegalStateException)
+        order.count { it.endsWith(':UNDONE=') } == 0
+        progress.any { it.contains('was missing; written from') }
+        progress.any { it.contains('kept the restored vda') }
+    }
+
     def 'file-restore copies are hot-attached live only, never into the persistent definition'() {
         when:
         def s = HostScripts.fileRestoreAttach('/mnt/pure-recover-a/vm1/root.qcow2', '/mnt/pure-recover-a',

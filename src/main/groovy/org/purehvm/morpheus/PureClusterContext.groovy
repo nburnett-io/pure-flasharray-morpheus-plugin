@@ -201,6 +201,33 @@ class PureClusterContext {
         }
     }
 
+    // ------------------------------------------------------------------ storage network MTU
+
+    static final String CFG_STORAGE_MTU = 'pureStorageMtu'
+    static final List<Integer> STORAGE_MTUS = [1500, 9000]
+    static final int DEFAULT_STORAGE_MTU = 9000
+
+    /** The MTU this cluster's iSCSI network should run at (compliance expects it, Apply MTU sets it); 9000 unless chosen. */
+    static int storageMtuOf(ComputeServerGroup c) {
+        String v = c?.getConfigProperty(CFG_STORAGE_MTU) as String
+        v?.isInteger() && (v as Integer) in STORAGE_MTUS ? v as Integer : DEFAULT_STORAGE_MTU
+    }
+
+    int getStorageMtu() {
+        storageMtuOf(cluster)
+    }
+
+    void setStorageMtu(int mtu) {
+        if (!(mtu in STORAGE_MTUS)) {
+            throw new IllegalArgumentException("Storage MTU must be one of ${STORAGE_MTUS.join(', ')}")
+        }
+        synchronized (JobHistory.LOCK) {
+            ComputeServerGroup fresh = morpheus.services.cluster.get(cluster.id) ?: cluster
+            [fresh, cluster].unique { System.identityHashCode(it) }.each { it.setConfigProperty(CFG_STORAGE_MTU, mtu) }
+            morpheus.services.cluster.save(fresh)
+        }
+    }
+
     /** Adds the link or updates its host group. Refuses a host group another cluster already uses on that array. */
     void setLink(Long storageServerId, String hostGroup) {
         if (hostGroup) {

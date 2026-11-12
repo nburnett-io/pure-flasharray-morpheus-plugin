@@ -109,6 +109,17 @@ class HostOnboarding {
             if (other) {
                 throw new IllegalStateException("${arrayName}: host group ${plan.hostGroup} belongs to cluster ${other}; refusing to add ${host}")
             }
+            // Never follow the hosts to another group silently: the cluster's datastore LUNs are connected to the linked
+            // group, so a relink here strands them (seen: hosts moved to a new group by hand, the join relinked to it).
+            String linked = link.hostGroup as String
+            if (linked && !linked.equalsIgnoreCase(plan.hostGroup)) {
+                throw new IllegalStateException("${arrayName}: this cluster is linked to host group ${linked}, but its hosts are in ${plan.hostGroup} on the array; " +
+                        "${host} was not added. Move the hosts back into ${linked} on the array, or relink with Apply host group (refused while datastore LUNs are still connected to ${linked})")
+            }
+            List<String> foreign = plan.foreignHvmHosts
+            if (foreign) {
+                step("WARNING ${arrayName}: ${HostGroupPlanner.foreignHvmMessage(plan.hostGroup, foreign)}")
+            }
             if (s.action == HostGroupPlanner.Action.OK) {
                 step("${arrayName}: ${host} already in host group ${plan.hostGroup} as ${s.arrayHost}")
             } else {
@@ -116,8 +127,8 @@ class HostOnboarding {
                 HostGroupPlanner.Plan one = new HostGroupPlanner.Plan(hostGroup: plan.hostGroup, createHostGroup: plan.createHostGroup, hosts: [s])
                 ap.apply(one, nodes).each { step("${arrayName}: ${it}".toString()) }
             }
-            if (link.hostGroup != plan.hostGroup) {
-                ctx.setLink(sid, plan.hostGroup)
+            if (!linked) {
+                ctx.setLink(sid, plan.hostGroup)   // first host of a link without a group: record the one it is in
             }
         }
     }

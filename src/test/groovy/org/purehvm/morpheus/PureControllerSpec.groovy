@@ -57,7 +57,7 @@ class PureControllerSpec extends Specification {
         def routes = new PureController(new PureFlashArrayPlugin(), Mock(MorpheusContext)).routes
 
         expect:
-        PureController.adminMethods(routes) == ['link', 'unlink', 'hostGroupApply', 'remediate', 'datastoreCreate', 'datastoreGrow', 'cloneDatastore',
+        PureController.adminMethods(routes) == ['link', 'unlink', 'hostGroupApply', 'remediate', 'storageMtu', 'storageMtuApply', 'datastoreCreate', 'datastoreGrow', 'cloneDatastore',
                                                 'hostAdd', 'hostMount', 'hostRescan', 'adopt', 'arrayHostRemove', 'iqnSync', 'retireFinish',
                                                 'retireMorpheus', 'datastoreShare', 'reclaimDelete', 'recoveryOrphanRemove'] as Set
         // engineers (Operations: full) keep every snapshot restore

@@ -154,5 +154,7 @@ Tested on: Morpheus 9.1, an HVM cluster of two hosts on Ubuntu 24.04/26.04, one 
 | Leftover recovery clones, persistent job history (0.13.5) | yes | partly | listing (none found) and history surviving a plugin reinstall, yes; removing a leftover, no |
 | Application-consistent snapshots (0.13.5, off by default) | yes | script content | refused while off, yes; freezing live guests, no |
 | Workflow task "Pure FlashArray snapshot" (0.13.5) | yes | option reading | yes: registered, ran against a test VM and took the snapshot |
+| Host-group guards: another cluster's HVM host in the group, relink away from the cluster's LUNs, silent relink on join; Retire of a cluster's only datastore (0.13.6) | yes | planner yes | the incident behind them was cleaned up by hand; the guards and the new Retire path, not yet |
+| Retire Override: delete stale volume records, clear Image Target (0.13.8) | yes | stale rule yes | not yet |
 | Several arrays per cluster, several clusters per array | yes | links, legacy migration, resolve, guard, adoption merge | single-link migration and tab, yes; a second array, no (tested with one) |
 | Morpheus wiring (storage server, tab, controller) | yes | API contract against plugin-api 1.5.0 | yes |

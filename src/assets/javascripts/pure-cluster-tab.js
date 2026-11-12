@@ -342,21 +342,27 @@
           if (rec.unreadable) rec = { heartbeatTarget: res[0].datastore.heartbeatTarget, unreadable: rec.unreadable };
           renderRetirePlan(v, res[0], rec);
         })
-        .catch(function (e) { err('retire', e); });
+        .catch(function (e) { retireAutoRun = false; err('retire', e); });
     }
+
+    var retireNote = '';   // the last Override's output, shown once above the re-plan
+    var retireAutoRun = false;   // set by a successful Override: the re-plan continues into Retire when it is clean
 
     function renderRetirePlan(v, p, rec) {
       var d = p.datastore, flags = [];
       if (rec.heartbeatTarget) flags.push('HA heartbeat target');
       if (rec.supportsVmSecureMetadata) flags.push('VM NVRAM/TPM state store');
       var wrap = el('div', {});
+      if (retireNote) { wrap.appendChild(el('pre', { text: retireNote })); retireNote = ''; }
       wrap.appendChild(el('div', { 'class': 'row' }, [el('strong', { text: d.name }), ' LUN ' + (p.array.volume || '?') + (p.array.server ? ' on ' + p.array.server : '') +
         ', ' + gib(d.sizeBytes) + ' (' + gib(d.freeBytes) + ' free)' + (d.active === false ? ', already drained' : '') + (flags.length ? ' - ' + flags.join(', ') : '')]));
       var disks = [];
       p.vms.forEach(function (vm) { vm.disks.forEach(function (k) { disks.push([vm.name, vm.power || '?', k.name, gib(k.maxBytes), gib(k.usedBytes), vm.instanceId ? 'instance ' + vm.instanceId : 'server only']); }); });
       wrap.appendChild(disks.length ? table(['VM', 'Power', 'Disk', 'Size', 'Allocated', 'Moved via'], disks)
                                     : el('div', { 'class': 'muted', text: 'No Morpheus disks on this datastore.' }));
-      (p.orphans || []).forEach(function (o) { wrap.appendChild(el('div', { 'class': 'st-WARN', text: 'Volume ' + o.name + ' (' + (o.path || '?') + ') belongs to no VM of this cluster' })); });
+      (p.orphans || []).forEach(function (o) { wrap.appendChild(el('div', { 'class': 'st-WARN', text: 'Volume ' + o.name + ' (' + (o.path || '?') + ') belongs to no VM of this cluster' +
+        (o.stale ? ' - stale record: no server holds it and its file is not on the datastore' : '') +
+        ((o.backs || []).length ? ' - it is the backing record of datastore ' + o.backs.join(', ') + ', so it is not deleted' : '') })); });
       var f = p.files || {};
       wrap.appendChild(el('div', { 'class': 'muted', text: 'On the filesystem' + (f.host ? ' (seen from ' + f.host + ')' : '') + ': ' + (f.known || []).length + ' Morpheus disk file(s), ' +
         (f.metadata || []).length + ' metadata file(s) (HA heartbeat, VM definition copies, restore-point index; removed with the datastore), ' +
@@ -364,8 +370,14 @@
       (f.unknown || []).slice(0, 20).forEach(function (x) { wrap.appendChild(el('div', { 'class': 'st-FAIL', text: '  not a Morpheus disk: ' + x.path + ' (' + gib(x.bytes) + ')' })); });
       (f.leftovers || []).forEach(function (x) { wrap.appendChild(el('div', { 'class': 'st-WARN', text: '  restore leftover: ' + x.path + ' (' + gib(x.bytes) + ')' })); });
 
-      // target: Auto (most free space that fits) or a specific datastore
-      var needTarget = disks.length > 0 || flags.length > 0;
+      // target: Auto (most free space that fits) or a specific datastore. The heartbeat / NVRAM flags of an EMPTY datastore
+      // with no other shared datastore to take them are simply cleared (the empty check still stops on NVRAM/TPM files):
+      // otherwise the cluster's only datastore could never be retired.
+      var anyFits = (p.targets || []).some(function (t) { return t.fits; });
+      var handover = flags.length > 0 && (disks.length > 0 || anyFits);
+      var needTarget = disks.length > 0 || handover;
+      if (flags.length && !handover) wrap.appendChild(el('div', { 'class': 'st-WARN', text: 'No other shared datastore can take over the ' + flags.join(' and ') +
+        '; the flag goes with this datastore and the cluster has none until you set it on another one.' }));
       var sel = el('select', {});
       var auto = (p.targets || []).filter(function (t) { return t.id === p.auto; })[0];
       sel.appendChild(el('option', { value: '', text: auto ? 'Auto: ' + auto.name + ' (' + gib(auto.freeBytes) + ' free)' : 'Auto: no datastore fits' }));
@@ -376,7 +388,6 @@
       });
       var leftoverBox = el('input', { type: 'checkbox' });
       var blockers = (p.blockers || []).slice();
-      if (flags.length && !auto && !(p.targets || []).some(function (t) { return t.fits; })) blockers.push('This datastore is the ' + flags.join(' and ') + '; another shared datastore must take that over first');
       if (needTarget) wrap.appendChild(el('div', { 'class': 'row' }, ['Move to: ', sel, el('span', { 'class': 'muted', text: 'needs ' + gib(p.need) + ' + 20% headroom' })]));
       if ((f.leftovers || []).length) wrap.appendChild(el('label', { 'class': 'row' }, [leftoverBox, ' Delete the restore leftovers with the datastore (the LUN stays recoverable in the destroyed bucket)']));
       if (rec.unreadable) wrap.appendChild(el('div', { 'class': 'st-WARN', text: 'Could not read this datastore through the Morpheus API as you, so whether it holds VM NVRAM/TPM state is unknown; the empty-check before deleting still stops on any such files.' }));
@@ -387,17 +398,60 @@
         var targetId = sel.value ? Number(sel.value) : p.auto;
         var target = (p.targets || []).filter(function (t) { return t.id === targetId; })[0];
         if (needTarget && !target) { alert('Choose a target datastore'); return; }
-        if (!confirm('Retire ' + d.name + '?\n\n' + (flags.length ? '1. Hand ' + flags.join(' and ') + ' over to ' + target.name + '\n' : '') +
+        if (!confirm('Retire ' + d.name + '?\n\n' + (handover ? '1. Hand ' + flags.join(' and ') + ' over to ' + target.name + '\n'
+            : (flags.length ? '1. Clear ' + flags.join(' and ') + ' (no other datastore takes it)\n' : '')) +
             '2. Drain it (no new disks)\n' + (disks.length ? '3. Move ' + disks.length + ' disk(s) of ' + p.vms.length + ' VM(s) to ' + target.name + ' with Morpheus Reconfigure (live; Morpheus drops VM snapshots of moved disks)\n' : '') +
             '4. Check it is empty, delete it in Morpheus\n5. Remove the LUN from every host, disconnect it and destroy it on ' + (p.array.server || 'the array') +
             ' (recoverable from the destroyed bucket until the array eradicates it)\n\nEach step stops on the first error; run Retire again to continue.')) return;
+        startRetire(target);
+      }, 'btn-danger');
+      function startRetire(target) {
         go.disabled = true;
-        runRetire(v, p, rec, target, leftoverBox.checked, function (s) { log.textContent += s + '\n'; })
+        runRetire(v, p, rec, needTarget ? target : null, leftoverBox.checked, function (s) { log.textContent += s + '\n'; })
           .then(function () { go.disabled = false; })
           .catch(function (e) { log.textContent += 'STOPPED: ' + e.message + '\n'; go.disabled = false; loadStatus(); });
-      }, 'btn-danger');
+      }
       if (blockers.length) go.disabled = true;
-      wrap.appendChild(actions([go, btn('Re-plan', function () { retire(v); })]));
+      // after an Override the user already confirmed the whole retire: carry on when the new plan is clean
+      if (retireAutoRun) {
+        retireAutoRun = false;
+        var clean = !blockers.length && !disks.length && !(p.orphans || []).length && !(f.unknown || []).length &&
+          !(f.known || []).length && !(f.leftovers || []).length && !(handover && !p.auto);
+        if (clean) {
+          var autoTarget = (p.targets || []).filter(function (t) { return t.id === p.auto; })[0];
+          setTimeout(function () { log.textContent += 'Continuing with Retire (confirmed with the Override)...\n'; startRetire(autoTarget); }, 0);
+        } else {
+          wrap.appendChild(el('div', { 'class': 'st-WARN', text: 'Override done, but the plan is not clean yet (see above), so Retire did not continue. Fix what is listed and click Retire.' }));
+        }
+      }
+      // Override: delete the stale volume records (no server holds them, no file behind them; the server re-proves
+      // both) and clear Morpheus's Image Target flag. Database records only; nothing on the hosts or the array.
+      var stale = (p.orphans || []).filter(function (o) { return o.stale; });
+      var imageTarget = rec.defaultStore === true || d.imageTarget === true;
+      var overrideBtn = null;
+      if (stale.length || imageTarget) {
+        if (imageTarget) wrap.appendChild(el('div', { 'class': 'st-WARN', text: d.name + ' is an Image Target in Morpheus.' }));
+        var what = [];
+        if (stale.length) what.push('delete ' + stale.length + ' stale volume record(s)');
+        if (imageTarget) what.push('clear Image Target');
+        overrideBtn = btn('Override: ' + what.join(' + '), function () {
+          if (!confirm('Override on ' + d.name + '?\n\n' +
+              (stale.length ? 'Delete these Morpheus volume records (no server holds them and their file is not on the datastore; checked again before deleting):\n' +
+                stale.map(function (o) { return '  ' + o.name + ' (' + (o.path || 'no path') + ', ' + gib(o.maxBytes) + ')'; }).join('\n') + '\n\n' : '') +
+              (imageTarget ? 'Clear Image Target on ' + d.name + '.\n\n' : '') +
+              'These change only Morpheus records. Then, if the new plan is clean, Retire continues by itself: ' +
+              (flags.length ? 'hand over or clear ' + flags.join(' and ') + ', ' : '') + 'check it is empty, delete it in Morpheus, remove the LUN from every host, ' +
+              'disconnect it and destroy it on ' + (p.array.server || 'the array') + ' (recoverable from the destroyed bucket until the array eradicates it).')) return;
+          overrideBtn.disabled = true;
+          var say = function (s) { log.textContent += s + '\n'; };
+          var chain = Promise.resolve();
+          if (stale.length) chain = chain.then(function () { say('Deleting stale volume records...'); return call('retire-morpheus', { op: 'stale-volumes-delete', datastoreId: d.id }, true).then(function (r) { say('  ' + r.done); }); });
+          if (imageTarget) chain = chain.then(function () { say('Clearing Image Target...'); return call('retire-morpheus', { op: 'image-target-clear', datastoreId: d.id }, true).then(function (r) { say('  ' + r.done); }); });
+          chain.then(function () { say('Override done; re-planning...'); retireNote = log.textContent; retireAutoRun = true; retire(v); })
+            .catch(function (e) { say('STOPPED: ' + e.message); overrideBtn.disabled = false; });
+        }, 'btn-warning');
+      }
+      wrap.appendChild(actions([go, overrideBtn, btn('Re-plan', function () { retire(v); })].filter(function (b) { return b; })));
       wrap.appendChild(log);
       show('retire', wrap);
     }
@@ -440,8 +494,9 @@
       function morph(action, extra) {
         return call('retire-morpheus', Object.assign({ op: action, datastoreId: src }, extra || {}), true).then(function (r) { say('  ' + r.done); });
       }
-      if (rec.heartbeatTarget) then(function () { say('Making ' + target.name + ' an HA heartbeat target'); return morph('heartbeat-handover', { targetId: target.id }); });
-      if (rec.supportsVmSecureMetadata) then(function () {
+      // target is null when nothing moves and no other datastore can take the flags: they are cleared below instead
+      if (rec.heartbeatTarget && target) then(function () { say('Making ' + target.name + ' an HA heartbeat target'); return morph('heartbeat-handover', { targetId: target.id }); });
+      if (rec.supportsVmSecureMetadata && target) then(function () {
         say('Moving the VM NVRAM/TPM state designation to ' + target.name);
         return mapi('PUT', '/api/clusters/' + clusterId + '/datastores/' + target.id, { datastore: { supportsVmSecureMetadata: true } }).catch(function (e) {
           throw new Error('Could not move the VM NVRAM/TPM designation (' + e.message + ').' +
@@ -596,6 +651,15 @@
           });
           var rescan = adm(btn('Rescan', function () { start('host-rescan', { host: h.node }, function () { loadHosts(); }); }));
           var arr = btn('Array view', function () { showArrayHosts(detail); });
+          var mtu = adm(btn('Apply MTU', function () {
+            if (confirm('Set ' + h.node + '\'s iSCSI virtSwitches to MTU ' + storageMtu + ' (hvmcli)?\n\n' +
+                'One fabric at a time: it starts only if every FlashArray LUN has all its paths up (at least 2), changes one virtSwitch, ' +
+                (storageMtu === 9000 ? 'tests jumbo frames to the array portals on that fabric, ' : '') +
+                'waits for every path to come back, then does the next. Any failure puts that virtSwitch back and stops.\n\n' +
+                'That fabric\'s links bounce for a few seconds; VMs keep running on the other fabric. Safest with the host in maintenance mode.'))
+              start('storage-mtu-apply', { host: h.node }, function () { loadHosts(); });
+          }, 'btn-warning'));
+          var mtuPreview = adm(btn('Preview MTU', function () { start('storage-mtu-apply', { host: h.node, preview: true }); }));
           var name = el('div', {}, [el('div', { text: h.node }), el('div', { 'class': 'muted', text: h.iqn || 'no IQN' })]);
           if (h.iqnMismatch) {
             name.appendChild(el('div', { 'class': 'st-WARN', text: 'Morpheus record says ' + h.iqnRecord + ' (stale): the array must use the IQN above' }));
@@ -603,7 +667,7 @@
               call('iqn-sync', {}, true).then(function (r) { alert(r.changed.length ? r.changed.join('\n') : 'Already up to date'); loadHosts(); }).catch(function (e) { alert(e.message); });
             }))]));
           }
-          return [name].concat(cells, [storage, actions([mount, rescan, check, arr])]);
+          return [name].concat(cells, [storage, actions([mount, rescan, check, arr, mtuPreview, mtu])]);
         });
         var head = ['Host'].concat(hs.arrays.map(function (a) { return arrayName(a.storageServerId) + (a.hostGroup ? ' / ' + a.hostGroup : ''); }), ['Datastores on this host', '']);
         list.push(table(head, rows));
@@ -615,14 +679,37 @@
     /** The automatic check's last result, under the compliance section's buttons. */
     function renderAutoCompliance(s) {
       var c = s.compliance || {}, box = root.querySelector('[data-field="auto-compliance"]');
-      if (!c.everyHours) { lib.put(box, el('span', { 'class': 'muted', text: 'Automatic check is off (plugin setting).' })); return; }
+      storageMtu = s.storageMtu || 9000;
+      var top = [mtuControl()];
+      Object.keys(s.gfs2LockAlarms || {}).forEach(function (h) {
+        top.push(el('div', { 'class': 'err', text: 'GFS2 without cluster locking on ' + h + ': ' + s.gfs2LockAlarms[h] }));
+      });
+      if (!c.everyHours) { lib.put(box, el('div', {}, top.concat([el('span', { 'class': 'muted', text: 'Automatic check is off (plugin setting).' })]))); return; }
       var head = 'Checked automatically every ' + c.everyHours + ' h; failing hosts get a Morpheus alarm (Operations > Alarms).';
-      if (!c.at && !(c.hosts || []).length) { lib.put(box, el('span', { 'class': 'muted', text: head + ' Not run yet since the plugin loaded.' })); return; }
-      lib.put(box, el('div', {}, [el('div', { 'class': 'muted', text: head + (c.at ? ' Last full check ' + new Date(c.at).toLocaleString() + ':' : '') }),
+      if (!c.at && !(c.hosts || []).length) { lib.put(box, el('div', {}, top.concat([el('span', { 'class': 'muted', text: head + ' Not run yet since the plugin loaded.' })]))); return; }
+      lib.put(box, el('div', {}, top.concat([el('div', { 'class': 'muted', text: head + (c.at ? ' Last full check ' + new Date(c.at).toLocaleString() + ':' : '') }),
         el('div', {}, (c.hosts || []).map(function (h) {
           return el('div', { 'class': h.error ? 'st-WARN' : (h.failed ? 'st-FAIL' : 'st-PASS'),
             text: h.host + ': ' + (h.error ? h.error : (h.failed ? h.failed + ' failing (' + h.checks.filter(function (c, i) { return h.checks.indexOf(c) === i; }).join(', ') + ')' : 'passes')) });
-        }))]));
+        }))])));
+    }
+
+    var storageMtu = 9000;
+
+    /** The cluster's storage MTU: what compliance expects (NET-01/06, NET-02 only at 9000) and Apply MTU sets per host. */
+    function mtuControl() {
+      var sel = el('select', {});
+      [1500, 9000].forEach(function (v) { var o = el('option', { value: v, text: String(v) }); if (v === storageMtu) o.selected = true; sel.appendChild(o); });
+      var save = adm(btn('Save', function () {
+        var v = Number(sel.value);
+        if (v === storageMtu) return;
+        if (!confirm('Set this cluster\'s storage (iSCSI) MTU to ' + v + '?\n\nThis changes nothing on the hosts: Check then expects ' + v +
+            ', and Apply MTU on each host (Hosts section) sets it there, one fabric at a time.' +
+            (v === 9000 ? '\n\n9000 needs jumbo frames on every switch port and on the array\'s iSCSI ports; Apply MTU tests that and puts a fabric back if it fails.' : ''))) { sel.value = storageMtu; return; }
+        call('storage-mtu', { mtu: v }, true).then(function (r) { storageMtu = r.storageMtu; loadStatus(); loadHosts(); }).catch(function (e) { alert(e.message); sel.value = storageMtu; });
+      }));
+      return el('div', { 'class': 'row' }, ['Storage (iSCSI) MTU for this cluster: ', sel, save,
+        el('span', { 'class': 'muted', text: 'Compliance expects it; Apply MTU (per host, Hosts section) sets it through hvmcli.' })]);
     }
 
     function hhmm(ms) { return ms ? new Date(ms).toLocaleString() : ''; }

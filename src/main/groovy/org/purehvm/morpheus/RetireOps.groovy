@@ -135,7 +135,53 @@ class RetireOps {
     List<Map> orphanVolumes(Long datastoreId, Collection<Long> heldVolumeIds) {
         morpheus.services.storageVolume.list(new DataQuery().withFilter('datastore.id', datastoreId))
                 .findAll { !heldVolumeIds.contains(it.id) }
-                .collect { [volumeId: it.id, name: it.name, path: it.externalId, maxBytes: it.maxStorage] }
+                .collect { StorageVolume v ->
+                    List<Datastore> backed = datastoresBackedBy(v.id)
+                    [volumeId: v.id, name: v.name, path: v.externalId, maxBytes: v.maxStorage,
+                     backs: backed*.name, backsOnlySelf: backed && backed.every { it.id == datastoreId }]
+                }
+                // the datastore's own backing record is part of the datastore, not something on it
+                .findAll { !it.backsOnlySelf }
+    }
+
+    /**
+     * Stale volume records: orphans whose disk file provably does not exist and that no server holds. Proof needs a
+     * complete listing of the mounted filesystem; an unmounted or truncated listing proves nothing, so then none are
+     * stale. A record whose path is a directory prefix of a listed file is not stale either.
+     */
+    static List<Map> staleVolumes(List<Map> orphans, Map files, Collection<Long> heldIds) {
+        if (!files?.mounted || files.truncated) {
+            return []
+        }
+        Set<String> paths = ((files.files ?: []) as List<Map>).collect { it.path as String } as Set<String>
+        orphans.findAll { Map o ->
+            String p = (o.path ?: '') as String
+            !heldIds.contains(o.volumeId as Long) && !o.backs && !(p && (paths.contains(p) || paths.any { it.startsWith(p + '/') }))
+        }
+    }
+
+    /**
+     * Datastores whose backing record (Datastore.storageVolume) is this volume. Seen on 9.1: a volume record that no
+     * server holds can still back a datastore, and deleting it then fails on a foreign key.
+     */
+    List<Datastore> datastoresBackedBy(Long volumeId) {
+        try {
+            return morpheus.services.cloud.datastore.list(new DataQuery().withFilter('storageVolume.id', volumeId))
+        } catch (Exception e) {
+            log.debug("storageVolume.id filter not supported (${e.message}); scanning the cloud's datastores")
+            return morpheus.services.cloud.datastore.list(new DataQuery().withFilter('cloud.id', ctx.cluster.cloud.id))
+                    .findAll { it.storageVolume?.id == volumeId }
+        }
+    }
+
+    /** Ids of every volume any server of this cluster's cloud holds (hosts, VMs, unmanaged VMs, any tenant). */
+    Set<Long> volumesHeldInCloud() {
+        Set<Long> ids = [] as Set<Long>
+        morpheus.services.computeServer.list(new DataQuery().withFilter('cloud.id', ctx.cluster.cloud.id)).each { ComputeServer listed ->
+            ComputeServer s = morpheus.services.computeServer.get(listed.id) ?: listed
+            (s.volumes ?: []).each { StorageVolume v -> ids << v.id }
+        }
+        ids
     }
 
     /** Shared datastores of this cluster that can take the disks (GFS2 or NFS; never a host-local directory pool). */
@@ -197,6 +243,19 @@ class RetireOps {
         [mounted: false, files: []]
     }
 
+    /** Processes on any host that hold the mount (unmount would fail there): "host: PID n (user, command)". */
+    List<String> mountHolders(String mountPath) {
+        if (!(mountPath ==~ HostScripts.GFS2_MOUNT_PATH)) {
+            return []
+        }
+        ctx.onAllHosts(HostScripts.mountHolders(mountPath)).collectMany { String h, HostRunner.Result res ->
+            res.all('HOLDER').collect { String l ->
+                List<String> f = l.split(/\|/, 3) as List<String>
+                "${h}: PID ${f[0]} (${f.size() > 1 ? f[1] : '?'}, ${f.size() > 2 ? f[2] : '?'})".toString()
+            }
+        } as List<String>
+    }
+
     Map plan(Long datastoreId, Collection<String> openRecoveryVolumes = []) {
         Datastore ds = ctx.datastore(datastoreId)
         Map arr = arrayVolume(ds)
@@ -207,6 +266,8 @@ class RetireOps {
         Map sorted = classifyFiles(files.files as List<Map>, (disks + orphans)*.path as List<String>)
         long need = (disks.sum { footprint(it as Map) } ?: 0L) as long
         Map choice = chooseTarget(candidates(datastoreId), need)
+        Set<Long> staleIds = (orphans ? staleVolumes(orphans, files, volumesHeldInCloud())*.volumeId : []) as Set<Long>
+        orphans.each { Map o -> o.stale = staleIds.contains(o.volumeId as Long) }
 
         List<String> blockers = []
         List<String> warnings = []
@@ -218,24 +279,34 @@ class RetireOps {
         if (arr.volume && openRecoveryVolumes.contains(arr.volume)) {
             blockers << 'A recovery session is open on this datastore: close it first'
         }
+        List<String> holders = disks ? [] : mountHolders(ds.externalPath)
+        if (holders) {
+            blockers << ("Something on the hosts still has the datastore open, so its unmount would fail and Morpheus's delete with it. " +
+                    "Close these first (often a login shell whose current directory is inside ${ds.externalPath}): ${holders.join('; ')}").toString()
+        }
         if (disks && !choice.auto) {
             blockers << "No other shared datastore on this cluster has room for ${need} bytes (+${(int) (HEADROOM * 100)}% headroom)".toString()
         }
         if (orphans) {
-            warnings << "${orphans.size()} Morpheus volume(s) on this datastore belong to no VM of this cluster; Retire cannot move them and will stop before deleting".toString()
+            warnings << "${orphans.size()} Morpheus volume(s) on this datastore belong to no VM of this cluster; Retire cannot move them and will stop before deleting".toString() +
+                    (staleIds ? " (${staleIds.size()} of them are stale records: no server holds them and their file is not on the datastore; Override deletes those records)".toString() : '')
         }
         if (sorted.unknown) {
             warnings << "${(sorted.unknown as List).size()} file(s) on the datastore are not Morpheus disks; Retire will stop before deleting until they are removed".toString()
+        }
+        if (!files.mounted) {
+            warnings << 'Not mounted on any host of this cluster, so the files on it could not be checked: only Morpheus\'s records were (VMs, disks). ' +
+                    'The LUN is destroyed, not eradicated, so it stays recoverable until the array eradicates it.'
         }
         if (files.truncated) {
             warnings << "Only the first ${HostScripts.LIST_FILES_MAX} of ${files.count} files are listed".toString()
         }
         vms.findAll { !it.instanceId }.each { warnings << "${it.name} has no Morpheus instance; it will be moved with the server-level Reconfigure (not yet tested)".toString() }
 
-        [datastore: [id: ds.id, name: ds.name, active: ds.active, online: ds.online, heartbeatTarget: ds.heartbeatTarget,
+        [datastore: [id: ds.id, name: ds.name, active: ds.active, online: ds.online, heartbeatTarget: ds.heartbeatTarget, imageTarget: ds.defaultStore,
                      sizeBytes: ds.storageSize, freeBytes: ds.freeSpace, mountPath: ds.externalPath],
          array    : arr, vms: vms, orphans: orphans, files: [mounted: files.mounted, host: files.host, count: files.count] + sorted,
-         need     : need, targets: choice.targets, auto: choice.auto?.id, blockers: blockers, warnings: warnings,
+         need     : need, targets: choice.targets, auto: choice.auto?.id, blockers: blockers, warnings: warnings, holders: holders,
          empty    : !disks && !orphans]
     }
 
@@ -272,9 +343,63 @@ class RetireOps {
                 ds.heartbeatTarget = false
                 morpheus.services.cloud.datastore.save(ds)
                 return "${ds.name}: no longer an HA heartbeat target".toString()
+            case 'image-target-clear':
+                // Morpheus's "Image Target" checkbox is Datastore.defaultStore
+                ds.defaultStore = false
+                morpheus.services.cloud.datastore.save(ds)
+                List<String> others = ctx.datastores.findAll { it.id != ds.id && it.defaultStore }*.name
+                return "${ds.name}: no longer an image target".toString() +
+                        (others ? " (image target now: ${others.join(', ')})".toString() : ' - WARNING: no datastore of this cluster is an image target now')
+            case 'stale-volumes-delete':
+                return deleteStaleVolumes(ds)
             default:
                 throw new IllegalArgumentException("Unknown action ${action}")
         }
+    }
+
+    /**
+     * Override for Retire: deletes the Morpheus volume RECORDS on the datastore that are provably stale (no server
+     * holds them, no file behind them on the mounted filesystem), re-proved here rather than taken from the browser.
+     * Only database records go; nothing on the hosts or the array is touched.
+     */
+    private String deleteStaleVolumes(Datastore ds) {
+        List<Map> orphans = orphanVolumes(ds.id, vmsOn(ds.id).collectMany { it.disks as List<Map> }*.volumeId as List<Long>)
+        List<Map> stale = staleVolumes(orphans, filesOn(ds.externalPath), volumesHeldInCloud())
+        if (!stale) {
+            return "${ds.name}: no stale volume records (${orphans.size()} other volume(s) are held by a server or have a file on the datastore)".toString()
+        }
+        List<String> done = []
+        List<String> failed = []
+        stale.each { Map o ->
+            String label = "${o.name} (${o.volumeId})".toString()
+            try {
+                StorageVolume v = morpheus.services.storageVolume.get(o.volumeId as Long)
+                if (v == null) {
+                    done << "${label} already gone".toString()
+                } else if (v.datastore?.id == ds.id) {
+                    morpheus.services.storageVolume.remove(v)
+                    if (morpheus.services.storageVolume.get(o.volumeId as Long) != null) {
+                        failed << "${label}: Morpheus kept it".toString()
+                    } else {
+                        done << label
+                    }
+                }
+            } catch (Exception e) {
+                // one record the database refuses (another row still points at it) must not stop the rest
+                log.warn("[${ctx.cluster.name}] stale volume record ${label}: ${e}")
+                failed << "${label}: ${e.message ?: e.class.simpleName}".toString()
+            }
+        }
+        List<String> kept = orphans.findAll { o -> !stale.any { it.volumeId == o.volumeId } }.collect { Map o ->
+            "${o.name} (${o.volumeId})".toString() + (o.backs ? " backs datastore ${(o.backs as List).join(', ')}".toString() : '')
+        }
+        String msg = "${ds.name}: deleted ${done.size()} stale volume record(s)".toString() + (done ? ": ${done.join(', ')}".toString() : '') +
+                (kept ? "; kept ${kept.size()} (held or with a file): ${kept.join(', ')}".toString() : '')
+        log.info("[${ctx.cluster.name}] retire override: ${msg}" + (failed ? "; failed: ${failed.join('; ')}" : ''))
+        if (failed) {
+            throw new IllegalStateException(msg + "; FAILED ${failed.size()}: ${failed.join('; ')}".toString())
+        }
+        msg
     }
 
     /** Deletes the Morpheus datastore through core's datastore-type service, after re-proving it is empty. */
@@ -293,8 +418,20 @@ class RetireOps {
             throw new IllegalStateException("${ds.name} is not empty: ${q.vms.size()} VM(s), ${(q.orphans as List).size()} other volume(s), " +
                     "${(f.known as List).size()} disk file(s), ${(f.unknown as List).size()} other file(s), ${(f.leftovers as List).size()} restore leftover(s)")
         }
+        if (q.holders) {
+            throw new IllegalStateException("${ds.name} is still open on a host, so the unmount would fail: ${(q.holders as List).join('; ')}")
+        }
         step("deleting ${ds.name} in Morpheus (core unmounts it and removes its storage pools on the hosts)")
-        def r = MorpheusSession.run(morpheus) { morpheus.services.storage.datastoreType.removeDatastore(ds) }
+        def r
+        try {
+            r = MorpheusSession.run(morpheus) { morpheus.services.storage.datastoreType.removeDatastore(ds) }
+        } catch (Exception e) {
+            // core reports a failed host unmount only as an empty result (NoSuchElementException): say where it is still mounted
+            List<String> still = ctx.onAllHosts(HostScripts.mountHolders(ds.externalPath)).findAll { h, res -> res.kv.MOUNTED == '1' }
+                    .collect { h, res -> h + (res.all('HOLDER') ? " (held by PID ${res.all('HOLDER').collect { it.split(/\|/)[0] }.join(', ')})" : '') }
+            throw new IllegalStateException("Morpheus could not delete ${ds.name} (${e.class.simpleName}${e.message ? ': ' + e.message : ''})" +
+                    (still ? "; still mounted on ${still.join(', ')}. Close whatever holds it there and run Retire again".toString() : ''))
+        }
         if (r instanceof com.morpheusdata.response.ServiceResponse && !r.success) {
             throw new IllegalStateException("Morpheus refused to delete ${ds.name}: ${r.msg ?: r.errors}")
         }
