@@ -34,7 +34,7 @@ class PluginLoadSpec extends Specification {
         plugin.settings.find { it.fieldName == 'enableGuestFreeze' }.defaultValue == 'off'      // guests are never frozen unless turned on
         plugin.settings.find { it.fieldName == 'multipathAllowZero' }.defaultValue == 'off'
         plugin.providers*.code.contains('pure-flasharray-hvm.snapshotTask')
-        plugin.settings.find { it.fieldName == 'multipathNoPathRetry' }.defaultValue == '0'
+        plugin.settings.find { it.fieldName == 'multipathNoPathRetry' }.defaultValue == '8'
         plugin.settings.find { it.fieldName == 'multipathToleranceWarnSeconds' }.defaultValue == '110'
         plugin.settings.find { it.fieldName == 'tagNamespace' }.defaultValue == 'org.purehvm'
         plugin.permissions*.code as Set == ['pure-flasharray-ops', 'pure-flasharray-restore', 'pure-flasharray-admin'] as Set

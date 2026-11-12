@@ -148,13 +148,13 @@ class ComplianceChecker {
                     'portal via its routed NIC, never through a gateway', 'cross-fabric')
         }
         // two sessions to one portal over the same NIC (typically "default" plus a virtual-switch iface) double the paths
-        // without adding redundancy; logging one out is a maintenance-window decision, so no automatic fix
-        List<String> doubled = live.groupBy { "${it.portal}|${it.viaNic}".toString() }.findAll { k, v -> v.size() > 1 }
+        // without adding redundancy; the session guard logs the extra one out (path-guarded), and so does this fix
+        List<String> doubled = live.groupBy { "${it.target}|${it.portal}|${it.viaNic}".toString() }.findAll { k, v -> v.size() > 1 }
                 .collect { k, v -> "${v[0].portal} via ${v[0].viaNic ?: '?'} (${v*.iface.join(', ')})".toString() }
         if (doubled) {
             r << new Result('ISC-03c', 'One session per portal and NIC', Severity.LOW, Status.WARN, doubled.join('; '),
-                    'one session per portal on each storage NIC', null,
-                    'Extra sessions over the same NIC add paths but no redundancy. To drop one, log it out in a maintenance window (iscsiadm -m node -T <target> -p <portal> -I <iface> --logout) and set that record to manual; ISC-07 then removes it.')
+                    'one session per portal on each storage NIC', 'cross-fabric',
+                    'Extra sessions over the same NIC add paths but no redundancy. Remediate logs the extra one out and deletes its record, keeping the iface the cluster\'s other hosts use; only while every path is healthy and each LUN keeps at least 2. The plugin does the same by itself every 10 minutes unless that setting is off.')
         }
         List<Map> unboundSessions = live.findAll { it.iface == 'default' }
         // in the all-unbound layout every session is on "default" by design
@@ -271,6 +271,15 @@ class ComplianceChecker {
         List<Map> badTimeout = sd.findAll { it.timeout != '60' }
         r << new Result('UDV-04', 'SCSI device timeout 60 s', Severity.MEDIUM, sd ? (badTimeout ? Status.FAIL : Status.PASS) : Status.NA,
                 badTimeout ? "${badTimeout.size()} device(s)".toString() : '60', '60', 'udev')
+        // the values are live sysfs state: with the rule file gone (another setup script deleted it on real hosts) they
+        // still read right until the next reboot, and a new LUN never gets them
+        if (f.udevRuleFile != null && f.queues) {
+            boolean liveOk = !r.any { it.id.startsWith('UDV-') && it.status == Status.FAIL }
+            r << new Result('UDV-00', 'udev rule file for FlashArray devices', Severity.MEDIUM, f.udevRuleFile ? Status.PASS : Status.WARN,
+                    f.udevRuleFile ? 'present' : (liveOk ? 'live values OK, rule file missing: lost at next reboot' : 'rule file missing'),
+                    Remediation.UDEV_RULES, 'udev',
+                    f.udevRuleFile ? null : 'The queue settings are applied by this file at boot and when a LUN appears. Remediate writes it again; live sessions and I/O are not touched.')
+        }
 
         // ---- network
         // MTU is never remediated automatically: the change bounces every link of the host's switch (management too),
@@ -353,7 +362,8 @@ class ComplianceChecker {
      * MP-03, the host's configured no_path_retry on its own terms. Tolerance of an all-paths outage is about
      * PATH_FAIL_SECONDS + N x polling_interval. What 0 costs on GFS2 was seen on a test host (path loss, EIO at the first
      * failed journal write, withdraw, host reset), not yet under a controller failover, and neither Pure nor HPE has said
-     * what GFS2 should use, so nothing here calls a value right.
+     * what GFS2 should use. So 0, fail and queue fail the check (0 and fail only warn when the site chose 0 explicitly),
+     * and no finite value is called right.
      */
     private static Result noPathRetryResult(HostFacts f, Context ctx) {
         String value = f.noPathRetry.value
@@ -367,11 +377,14 @@ class ComplianceChecker {
             new Result('MP-03', 'multipath no_path_retry', Severity.HIGH, st, observed, expected, resultFix, hint)
         }
         if (value in ['fail', '0']) {
-            boolean change = finiteRetry(ctx.noPathRetry)
-            return result(Status.WARN, "${value}${from}".toString(), change ? fix : null,
+            // 0 is a failure unless the site chose it (setting 0 with "allow lowering to 0"): a short all-paths loss
+            // withdraws GFS2 and the host is reset
+            boolean deliberate = ctx.noPathRetry == '0' && ctx.allowLowerToZero
+            String want = finiteRetry(ctx.noPathRetry) ? "The plugin setting asks for ${ctx.noPathRetry}" : "The plugin default is ${Remediation.DEFAULT_NO_PATH_RETRY}"
+            return result(deliberate ? Status.WARN : Status.FAIL, "${value}${from}".toString(), deliberate ? null : fix,
                     "This is Pure's written value. On GFS2, an all-paths window over about ${PATH_FAIL_SECONDS} s withdraws the filesystem and the host is reset about 2 minutes later " +
                             '(seen on a test host with a path drop; not yet under a real controller failover). Vendor guidance is pending.' +
-                            (change ? (fix ? " The plugin setting asks for ${ctx.noPathRetry}: Remediate writes it." : " The plugin setting asks for ${ctx.noPathRetry}. ${overridesHint}") : ''))
+                            (deliberate ? ' Kept: the plugin setting is 0 and lowering to 0 is allowed.' : (fix ? " ${want}: Remediate writes it." : " ${want}. ${overridesHint}")))
         }
         if (value == 'queue') {
             return result(Status.FAIL, "queue${from}".toString(), fix, source == 'overrides' ? overridesHint : null)

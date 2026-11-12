@@ -82,7 +82,7 @@ class ComplianceMonitor {
     static List<Map> check(PureClusterContext ctx, String only = null, Map settings = [:]) {
         Map info = arrayFacts(ctx)
         ComplianceChecker.Context cc = new ComplianceChecker.Context(info.portals as List<String>, info.iqns as Set<String>, info.purity as String,
-                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry), toleranceWarnSeconds(settings), allowZero(settings), ctx.storageMtu,
+                Remediation.noPathRetrySetting(settings?.multipathNoPathRetry, allowZero(settings)), toleranceWarnSeconds(settings), allowZero(settings), ctx.storageMtu,
                 info.iqnsPerArray as List<Set<String>>)
         ctx.onAllHosts(probe(info.portals as List<String>), only ? [only] : ctx.hostNames).collect { String h, HostRunner.Result res ->
             hostView(h, res, cc)
@@ -174,8 +174,35 @@ class ComplianceMonitor {
         setHostAlarm(morpheus, ctx.cluster.owner, host, uniqueId(host.id), CATEGORY, "Pure FlashArray compliance: ${host.name}".toString(), alarm)
     }
 
+    static final String SETTINGS_CATEGORY = 'pure-hvm-settings'
+
+    /**
+     * The alarm for plugin settings that were never saved (a fresh install, or an appliance rebuilt without them), or
+     * null. Every option then runs on its default, which once went unnoticed: the tag namespace of an upgraded install
+     * and the operator tenants are not defaults.
+     */
+    static Map settingsAlarm(Map settings) {
+        if (settings?.any { k, v -> v != null && v != '' }) {
+            return null
+        }
+        [status : 'warning',
+         message: 'Pure FlashArray for HVM: the plugin settings have never been saved on this appliance (fresh install or rebuilt appliance), so every option runs on its default. ' +
+                 'Open Administration > Integrations > Plugins, edit the plugin, check the values (array tag namespace, operator tenants, multipath no_path_retry) and save.']
+    }
+
+    /** Raises or clears the unsaved-settings alarm on one linked cluster. */
+    static void setSettingsAlarm(MorpheusContext morpheus, com.morpheusdata.model.ComputeServerGroup cluster, Map settings) {
+        setAlarmOn(morpheus, cluster.owner, 'computeServerGroup', cluster.id, cluster.name, "${SETTINGS_CATEGORY}-${cluster.id}".toString(),
+                SETTINGS_CATEGORY, "Pure FlashArray plugin settings: ${cluster.name}".toString(), settingsAlarm(settings))
+    }
+
     /** Creates, replaces or clears one of this plugin's alarms on a host, identified by {@code uid}. */
     static void setHostAlarm(MorpheusContext morpheus, com.morpheusdata.model.Account owner, ComputeServer host, String uid, String category, String name, Map alarm) {
+        setAlarmOn(morpheus, owner, 'computeServer', host.id, host.name, uid, category, name, alarm)
+    }
+
+    private static void setAlarmOn(MorpheusContext morpheus, com.morpheusdata.model.Account owner, String refType, Long refId, String resourceName,
+                                   String uid, String category, String name, Map alarm) {
         try {
             MorpheusSession.run(morpheus) {
                 List<OperationNotification> open = morpheus.services.operationNotification.list(new DataQuery().withFilter('uniqueId', uid))
@@ -187,15 +214,15 @@ class ComplianceMonitor {
                 if (alarm) {
                     def r = morpheus.services.operationNotification.createAlarm(new OperationNotification(
                             account: owner, category: category, eventKey: category, uniqueId: uid, name: name,
-                            resourceName: host.name, refType: 'computeServer', refId: host.id, status: alarm.status as String,
+                            resourceName: resourceName, refType: refType, refId: refId, status: alarm.status as String,
                             statusMessage: alarm.message as String, startDate: new Date(), acknowledged: false, active: true))
                     if (r != null && !r.success) {
-                        log.warn("${category} alarm on ${host.name} refused: ${r.msg ?: r.errors}")
+                        log.warn("${category} alarm on ${resourceName} refused: ${r.msg ?: r.errors}")
                     }
                 }
             }
         } catch (Throwable e) {
-            log.warn("${category} alarm on ${host.name} failed: ${e.message}", e)
+            log.warn("${category} alarm on ${resourceName} failed: ${e.message}", e)
         }
     }
 }

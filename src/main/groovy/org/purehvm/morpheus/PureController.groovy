@@ -367,7 +367,7 @@ class PureController implements PluginController {
             ok([cluster: [id: ctx.cluster.id, name: ctx.cluster.name], hosts: ctx.hostNames, linked: !links.isEmpty(), links: links,
                 experimental: experimental(), guestFreeze: ConsistentSnapshot.enabled(settings()), canAdmin: canAdmin(m.user), jobs: JobHistory.merged(Jobs.forCluster(ctx.cluster.id), ctx.cluster, 10),
                 compliance: (ComplianceMonitor.LAST[ctx.cluster.id] ?: [:]) + [everyHours: ComplianceMonitor.intervalHours(settings())],
-                storageMtu: ctx.storageMtu, gfs2LockAlarms: Gfs2LockGuard.LAST[ctx.cluster.id]?.findAll { it.value } ?: [:],
+                storageMtu: ctx.storageMtu, settingsUnsaved: ComplianceMonitor.settingsAlarm(settings()) != null, gfs2LockAlarms: Gfs2LockGuard.LAST[ctx.cluster.id]?.findAll { it.value } ?: [:],
                 existing: scans ? Adoption.merge(scans).findAll { it.state != 'adopted' } : [],
                 recoveries: RecoverySessions.refresh(ctx, hours).collect { sessionView(it) }, recoveryTimeoutHours: hours])
         }
@@ -642,9 +642,9 @@ class PureController implements PluginController {
                 List<String> applied = []
                 if ('cross-fabric' in (fixes ?: [])) {
                     // its own path-guarded script: the iSCSI/multipath remediation below never logs a session out
-                    progress << "${host}: removing iSCSI sessions that cross fabrics or go through a gateway".toString()
-                    Map x = IscsiFabricGuard.parse(ctx.runner.run(host, HostScripts.removeCrossFabricSessions(false)))
-                    (x.removed as List<String>).each { progress << "${host}: removed ${it}".toString(); Audit.warn(morpheus, null, ctx.cluster, 'removed a cross-fabric or routed iSCSI session', [host: host, session: it]) }
+                    progress << "${host}: removing iSCSI sessions that cross fabrics, go through a gateway or duplicate another".toString()
+                    Map x = IscsiFabricGuard.removeOn(ctx, host)
+                    (x.removed as List<String>).each { progress << "${host}: removed ${it}".toString(); Audit.warn(morpheus, null, ctx.cluster, 'removed a cross-fabric, routed or duplicate iSCSI session', [host: host, session: it]) }
                     ((x.kept + x.warnings) as List<String>).each { progress << "${host}: kept ${it}".toString() }
                     if (x.errors) {
                         throw new IllegalStateException("${host}: ${(x.errors as List).join('; ')}")

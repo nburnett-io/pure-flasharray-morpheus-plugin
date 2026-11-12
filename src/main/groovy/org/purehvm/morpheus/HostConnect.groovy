@@ -85,7 +85,7 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
             throw new IllegalStateException("${host}: the probe did not finish; nothing changed")
         }
         f.gatewayed.each { p, via -> progress << "${host}: portal ${p} is only reachable through a gateway (${via}); left alone".toString() }
-        String retry = Remediation.noPathRetrySetting(settings?.multipathNoPathRetry)
+        String retry = Remediation.noPathRetrySetting(settings?.multipathNoPathRetry, ComplianceMonitor.allowZero(settings))
         Collection<String> chosen = fixes
         if (chosen == null) {
             ComplianceChecker.Context cc = new ComplianceChecker.Context(portals, info.iqns as Set<String>, info.purity as String, retry,
@@ -98,7 +98,7 @@ iscsiadm -m session 2>/dev/null | awk '/purestorage/ {split($3,a,","); sub(/:[0-
         }
         String raw = (settings?.multipathNoPathRetry as String)?.trim()
         if ('multipath' in chosen && raw && raw != retry) {
-            progress << "${host}: the Multipath no_path_retry setting '${raw}' is not 0 or 1-60, so it counts as 0".toString()
+            progress << "${host}: the Multipath no_path_retry setting '${raw}' is not 1-60 (0 needs \"allow lowering to 0\"), so the default ${retry} is used".toString()
         }
         if ('iscsi-sessions' in chosen && f.hvmcli) {
             progress << (morpheusTargets == null

@@ -681,6 +681,10 @@
       var c = s.compliance || {}, box = root.querySelector('[data-field="auto-compliance"]');
       storageMtu = s.storageMtu || 9000;
       var top = [mtuControl()];
+      if (s.settingsUnsaved) {
+        top.push(el('div', { 'class': 'err', text: 'The plugin settings have never been saved on this appliance (fresh install or rebuild): every option runs on its default. ' +
+          'Check them under Administration > Integrations > Plugins (array tag namespace, operator tenants, multipath no_path_retry) and save.' }));
+      }
       Object.keys(s.gfs2LockAlarms || {}).forEach(function (h) {
         top.push(el('div', { 'class': 'err', text: 'GFS2 without cluster locking on ' + h + ': ' + s.gfs2LockAlarms[h] }));
       });

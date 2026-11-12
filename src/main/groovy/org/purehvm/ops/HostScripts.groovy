@@ -955,13 +955,24 @@ echo "PATHS=$(paths)"
      * correct sessions exist; and every FlashArray map must have at least 2 active paths first. After the logout no map
      * may be left without an active path, or the session logs in again and the run stops. Only then is its node record
      * deleted, so it does not come back at boot. With dryRun nothing changes: FOUND= lines only.
-     * Output: FOUND=<portal>|<iface>|<reason>, REMOVED=..., KEPT=<portal>|<iface>|<why>, ERROR=..., PATHS=...
+     *
+     * Duplicates go the same way: two sessions to one portal over the same NIC through different iface records (a
+     * virtual-switch iface and a hand-made one bound to the same netdev, or "default" beside a bound one) double the
+     * paths without adding redundancy. Kept is the iface earliest in {@code prefer} (what the cluster's clean hosts
+     * use), else a bound iface over "default", else the one with more sessions. A duplicate goes only while every path
+     * is healthy and every map has at least 3 active paths, and at least 2 must remain afterwards. An iface record left
+     * without any session then loses its FlashArray node records and is deleted itself, so a discovery that names no
+     * iface cannot bind to it again. The iSCSI records are saved to /root before the first change.
+     * Output: SESSION=<portal>|<iface>, FOUND=<portal>|<iface>|<reason>, REMOVED=..., KEPT=<portal>|<iface>|<why>,
+     * BACKUP=<file>, ERROR=..., PATHS=...
      */
-    static String removeCrossFabricSessions(boolean dryRun) {
+    static String removeCrossFabricSessions(boolean dryRun, List<String> prefer = []) {
+        String pref = (prefer ?: []).findAll { it ==~ /[A-Za-z0-9._:\-]+/ }.join(' ')
         HEADER + """DRY=${dryRun ? 1 : 0}
-""" + '''# maps|maps missing a path|maps with fewer than 2 active paths|maps with no active path (FlashArray maps only)
+PREFER='${pref}'
+""" + '''# maps|maps missing a path|maps with fewer than 2 active paths|maps with no active path|maps with fewer than 3 (FlashArray maps only)
 paths() { multipathd show paths raw format "%w|%t|%T" 2>/dev/null | awk -F'|' '$1 ~ /^3624a937/ {n[$1]++; if ($2 == "active" && $3 == "ready") a[$1]++}
-  END {t=0; b=0; f=0; z=0; for (w in n) {t++; if (a[w] < n[w]) b++; if (a[w] < 2) f++; if (a[w] < 1) z++}; print t "|" b "|" f "|" z}'; }
+  END {t=0; b=0; f=0; z=0; h=0; for (w in n) {t++; if (a[w] < n[w]) b++; if (a[w] < 2) f++; if (a[w] < 1) z++; if (a[w] < 3) h++}; print t "|" b "|" f "|" z "|" h}'; }
 # target|portal ip|port|iface|netdev|state of every FlashArray session
 sessions() { iscsiadm -m session -P1 2>/dev/null | awk '
   /^Target:/ {t=$2}
@@ -976,33 +987,72 @@ reason() { local ip=$1 nd=$2 r dev via
   if [ -n "$nd" ] && [ -n "$dev" ] && [ "$nd" != "$dev" ] && [ -z "$(ip -o route show to match "$ip" dev "$nd" scope link 2>/dev/null)" ]; then
     echo "crossed: $ip is on the subnet of $dev, session goes out $nd"; fi; }
 ALL=$(sessions)
-GOOD=""; BAD=""
+GOOD=""; GOODS=""; BAD=""
 while IFS='|' read -r t ip port iface nd st; do
   [ -n "$t" ] && [ "$st" = LOGGED_IN ] || continue
+  echo "SESSION=$ip|$iface"
   why=$(reason "$ip" "$nd")
   if [ -n "$why" ]; then BAD="$BAD$t|$ip|$port|$iface|$why
 "; else GOOD="$GOOD$ip
+"
+    # an unbound ("default") session leaves through the NIC the routing table picks
+    [ -n "$nd" ] || nd=$(ip -o route get "$ip" 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p')
+    GOODS="$GOODS$t|$ip|$port|$iface|$nd
 "; fi
 done <<< "$ALL"
 NGOOD=$(printf '%s' "$GOOD" | grep -c .)
-printf '%s' "$BAD" | while IFS='|' read -r t ip port iface why; do
+# correct sessions sharing target, portal and NIC: all but the iface to keep are duplicates
+DUPS=$(printf '%s' "$GOODS" | awk -F'|' -v prefer="$PREFER" '
+  function score(i) { return (i in rank) ? rank[i] : (i == "default" ? 3000 : 2000 - cnt[i]) }
+  BEGIN {n=split(prefer, P, " "); for (k=1; k<=n; k++) rank[P[k]]=k}
+  NF >= 5 {key=$1 "|" $2 "|" $5; cnt[$4]++; rows[key]=rows[key] $0 "\\n"; c[key]++}
+  END {for (key in c) if (c[key] > 1) {m=split(rows[key], R, "\\n"); best=""; bs=99999
+      for (k=1; k<m; k++) {split(R[k], f, "|"); s=score(f[4]); if (s < bs || (s == bs && f[4] < best)) {bs=s; best=f[4]}}
+      for (k=1; k<m; k++) {split(R[k], f, "|"); if (f[4] != best) print f[1] "|" f[2] "|" f[3] "|" f[4] "|duplicate of the session via " best " on " f[5]}}}')
+[ -n "$DUPS" ] && BAD="$BAD$DUPS
+"
+BACKED=0
+while IFS='|' read -r t ip port iface why; do
   [ -n "$t" ] || continue
   if [ "$DRY" = 1 ]; then echo "FOUND=$ip|$iface|$why"; continue; fi
+  S=$(paths); MUST=4
   case "$why" in
     crossed*) printf '%s' "$GOOD" | grep -qx "$ip" || { echo "KEPT=$ip|$iface|no correct session to $ip yet: it is this portal's only path"; continue; };;
+    duplicate*) MUST=3
+      [ "$(echo "$S" | cut -d'|' -f2)" = 0 ] && [ "$(echo "$S" | cut -d'|' -f5)" = 0 ] || { echo "KEPT=$ip|$iface|not every path is healthy, or a LUN has fewer than 3 active paths ($S)"; continue; };;
     *) [ "$NGOOD" -ge 2 ] || { echo "KEPT=$ip|$iface|fewer than 2 correct sessions on this host"; continue; };;
   esac
-  S=$(paths)
   [ "$(echo "$S" | cut -d'|' -f3)" = 0 ] || { echo "KEPT=$ip|$iface|a LUN has fewer than 2 active paths ($S)"; continue; }
+  if [ "$BACKED" = 0 ]; then
+    B="/root/pure-iscsi-records-$(date +%Y%m%d-%H%M%S).tgz"
+    (umask 077; tar czf "$B" /etc/iscsi/nodes /etc/iscsi/ifaces /var/lib/iscsi 2>/dev/null); echo "BACKUP=$B"; BACKED=1
+  fi
   iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" --logout >/dev/null 2>&1 || { echo "KEPT=$ip|$iface|logout failed"; continue; }
-  sleep 5
-  if [ "$(echo "$(paths)" | cut -d'|' -f4)" != 0 ]; then
+  sleep 6
+  # a crossed or routed session must not take a LUN's last path; a duplicate must leave every LUN at least 2
+  if [ "$(echo "$(paths)" | cut -d'|' -f$MUST)" != 0 ]; then
     iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" --login >/dev/null 2>&1
-    echo "ERROR=a LUN lost its last active path after logging out $ip via $iface: logged it back in; stopping"; exit 5
+    echo "ERROR=a LUN was left short of active paths after logging out $ip via $iface: logged it back in; stopping"; break
   fi
   iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" -o delete >/dev/null 2>&1 || echo "WARN=node record $ip via $iface not deleted: it may log in again at boot"
   echo "REMOVED=$ip|$iface|$why"
-done
+done <<< "$BAD"
+# an iface record that lost every session to the duplicate cleanup: its FlashArray node records go one by one, then the
+# record itself (a discovery that names no iface binds to every iface record, and would bring the duplicates back)
+if [ "$DRY" = 0 ] && [ -n "$DUPS" ]; then
+  NOW=$(sessions)
+  for x in $(printf '%s\\n' "$DUPS" | cut -d'|' -f4 | sort -u); do
+    [ "$x" = default ] && continue
+    printf '%s\\n' "$NOW" | awk -F'|' -v i="$x" '$4 == i' | grep -q . && continue
+    REC=$(iscsiadm -m node -P1 2>/dev/null | awk -v i="$x" '/^Target:/ {t=$2} /^[[:space:]]+Portal:/ {split($2, a, ","); p=a[1]} /Iface Name:/ {if ($3 == i) print t "|" p}')
+    if printf '%s\\n' "$REC" | grep -v purestorage | grep -q .; then echo "WARN=iface record $x kept: other targets use it"; continue; fi
+    while IFS='|' read -r t p; do
+      [ -n "$t" ] && iscsiadm -m node -T "$t" -p "$p" -I "$x" -o delete >/dev/null 2>&1
+    done <<< "$REC"
+    if iscsiadm -m iface -I "$x" -o delete >/dev/null 2>&1; then echo "REMOVED=-|$x|iface record deleted: no session uses it"
+    else echo "WARN=iface record $x not deleted: a discovery can bind to it again"; fi
+  done
+fi
 echo "PATHS=$(paths)"
 '''
     }

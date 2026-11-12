@@ -36,6 +36,7 @@ class HostFacts {
     boolean hvmcli
     Map<String, String> linkState = [:]      // interface -> operstate (empty: probe older than 0.13.2)
     List<Map> virtswitches = []              // hvmcli virtSwitches [name, type, mtu (configured), interfaces]
+    Boolean udevRuleFile                     // the plugin's udev rule file exists (null: the probe did not say)
     boolean complete                         // saw the @@end marker
 
     static HostFacts parse(String output) {
@@ -158,6 +159,8 @@ class HostFacts {
         split(sections.gfs2withdraw).each { List<String> p -> f.gfs2Withdraw[p[0]] = p[1] }
         split(sections.gfs2tables).each { List<String> p -> f.gfs2Tables[p[0]] = p[1] }
         split(sections.pools).each { List<String> p -> if (p[0]) { f.pools << [name: p[0], target: p.size() > 1 ? p[1] : null, state: p.size() > 2 ? p[2] : null] } }
+        String rules = sections.udevrules?.find { it.trim() }?.trim()
+        f.udevRuleFile = rules ? rules == 'present' : null
         f.hvmcli = sections.hvmcli?.any { it.trim() } ?: false
         split(sections.linkstate).each { List<String> p -> if (p[0]) { f.linkState[p[0]] = p.size() > 1 ? p[1] : '' } }
         // Sessions on the "default" iface carry no netdev: the kernel routes them, so the route is the NIC.

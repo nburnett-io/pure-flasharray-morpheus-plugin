@@ -103,14 +103,17 @@ overrides|no_path_retry|queue
         multipath([:]).noPathRetry == [value: null, source: null]
     }
 
-    def 'MP-03: fail or 0 warns, as Pure\'s written value and without claiming a proven failure'() {
+    def 'MP-03: fail or 0 fails and offers the default, unless the site chose 0 explicitly'() {
         when:
         def r = mp03(multipath(stanza: value))
+        def chosen = mp03(multipath(stanza: value), new Context(ctx.portals, ctx.registeredIqns, ctx.purityVersion, '0', 110, true))
 
         then:
-        r.status == Status.WARN
+        r.status == Status.FAIL
         r.observed == value
-        r.fix == null                                     // default setting: Remediate would change nothing, so no button
+        r.fix == 'multipath'
+        r.hint.contains('The plugin default is 8: Remediate writes it.')
+        chosen.status == Status.WARN && chosen.fix == null && chosen.hint.contains('lowering to 0 is allowed')
         r.hint.contains("Pure's written value")
         r.hint.contains('about 20 s')
         r.hint.contains('Vendor guidance is pending')
@@ -233,23 +236,51 @@ overrides|no_path_retry|queue
         mp03b(f).with { status == Status.FAIL && fix == null }
     }
 
-    def 'the no_path_retry setting accepts 0 or 1-60; anything else, queue included, is Pure\'s 0'() {
+    def 'the no_path_retry setting accepts 1-60; unset and anything else is 8, and 0 needs "allow lowering to 0"'() {
         expect:
         Remediation.noPathRetrySetting(setting) == value
+        Remediation.noPathRetrySetting(setting, true) == allowed
 
         where:
-        setting | value
-        null    | '0'
-        ''      | '0'
-        '0'     | '0'
-        'fail'  | '0'
-        'queue' | '0'
-        '-1'    | '0'
-        '61'    | '0'
-        'x'     | '0'
-        '12'    | '12'
-        ' 60 '  | '60'
-        12      | '12'
+        setting | value | allowed
+        null    | '8'   | '8'      // never-saved plugin settings: this used to be 0, and hosts got no_path_retry 0
+        ''      | '8'   | '8'
+        '0'     | '8'   | '0'
+        'fail'  | '8'   | '8'
+        'queue' | '8'   | '8'
+        '-1'    | '8'   | '8'
+        '61'    | '8'   | '8'
+        'x'     | '8'   | '8'
+        '12'    | '12'  | '12'
+        ' 60 '  | '60'  | '60'
+        12      | '12'  | '12'
+    }
+
+    def 'a host at 0 gets the default from Remediate, and the job log says why'() {
+        when:
+        def s = new Remediation().scriptSteps(multipath(stanza: '0'), ['multipath'], [], '6.10.4', '0')*.script.join('')
+        def dropIn = new String(s.find(/echo '([A-Za-z0-9+\/=]+)' \| base64 -d/) { all, b64 -> b64 }.decodeBase64(), 'UTF-8')
+
+        then:
+        dropIn.contains('no_path_retry         8')
+        s.contains('no_path_retry 8 (the default: 0 is written only when lowering to 0 is allowed)')
+    }
+
+    def 'UDV-00: right live values with the rule file gone warn and offer the udev fix'() {
+        given:
+        String sample = getClass().getResource('/probe-sample.txt').text
+        Closure<ComplianceChecker.Result> udv00 = { String state ->
+            HostFacts f = HostFacts.parse(sample.replace('@@end', "@@udevrules\n${state}\n@@end"))
+            f.queues.each { it.scheduler = 'none'; it.addRandom = '0'; it.rqAffinity = '2'; it.maxSectorsKb = '4096' }
+            new ComplianceChecker().check(f, ctx).find { it.id == 'UDV-00' }
+        }
+
+        expect:
+        udv00('missing').with { status == Status.WARN && fix == 'udev' && observed == 'live values OK, rule file missing: lost at next reboot' }
+        udv00('present').with { status == Status.PASS && fix == null }
+        !results.any { it.id == 'UDV-00' }     // a probe that does not say: no finding
+        new ComplianceChecker().check(HostFacts.parse(sample.replace('@@end', '@@udevrules\nmissing\n@@end')), ctx)
+                .find { it.id == 'UDV-00' }.observed == 'rule file missing'   // the sample's scheduler is wrong: UDV-01 says so
     }
 
     def 'remediation never takes a finite value back to 0, wherever the host set it'() {
@@ -262,9 +293,9 @@ overrides|no_path_retry|queue
         '0'     | [defaults: '12']           | '12'
         '0'     | [overrides: '12']          | '12'
         '0'     | [stanza: '5', defaults: '12'] | '5'   // the device entry is what maps use
-        '0'     | [stanza: 'fail']           | '0'
-        '0'     | [stanza: 'queue']          | '0'
-        '0'     | [:]                        | '0'
+        '0'     | [stanza: 'fail']           | '8'   // 0 is never written unless lowering is allowed
+        '0'     | [stanza: 'queue']          | '8'
+        '0'     | [:]                        | '8'
         '12'    | [stanza: 'fail']           | '12'
         '12'    | [stanza: 'queue']          | '12'
         '12'    | [stanza: '30']             | '12'  // a finite setting is the site's explicit choice
@@ -410,6 +441,21 @@ overrides|no_path_retry|queue
         live.contains("dev \\([^ ]*\\)")
         live.contains('i == "default") n=""')   // an unbound session follows the routing table: never "crossed"
         !(live =~ /multipath -F|systemctl|reboot|rm -/)
+    }
+
+    def 'the removal script also drops duplicate sessions: stricter path guard, backup first, records deleted one by one'() {
+        when:
+        String live = HostScripts.removeCrossFabricSessions(false, ['iface_iSCSI-60', 'bad name; rm', 'iface_iSCSI-62'])
+
+        then:
+        live.contains("PREFER='iface_iSCSI-60 iface_iSCSI-62'")                 // an unsafe name never reaches the shell
+        live.contains('duplicate of the session via')
+        live.contains('fewer than 3 active paths')
+        live.indexOf('BACKUP=') < live.indexOf('--logout')
+        live.contains('iscsiadm -m iface -I "$x" -o delete')
+        live.contains('[ "$x" = default ] && continue')
+        !(live =~ /-m node -I \S+ -o delete/)                                   // never a node delete by iface filter alone
+        HostScripts.removeCrossFabricSessions(true).contains("PREFER=''")
     }
 
     def 'the probe reads hvmcli virtSwitch records'() {

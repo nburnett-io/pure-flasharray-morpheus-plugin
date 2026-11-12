@@ -156,5 +156,7 @@ Tested on: Morpheus 9.1, an HVM cluster of two hosts on Ubuntu 24.04/26.04, one 
 | Workflow task "Pure FlashArray snapshot" (0.13.5) | yes | option reading | yes: registered, ran against a test VM and took the snapshot |
 | Host-group guards: another cluster's HVM host in the group, relink away from the cluster's LUNs, silent relink on join; Retire of a cluster's only datastore (0.13.6) | yes | planner yes | the incident behind them was cleaned up by hand; the guards and the new Retire path, not yet |
 | Retire Override: delete stale volume records, clear Image Target (0.13.8) | yes | stale rule yes | not yet |
+| `no_path_retry` default 8, 0 only when allowed; unsaved-settings alarm; UDV-00 rule file (0.15.0) | yes | yes | setting and checks on three installs; the alarm itself, no (no install has unsaved settings now) |
+| Duplicate sessions removed automatically (0.15.0) | yes | choice of iface, script content | detection on real hosts with injected duplicates (read-only); a real removal by the plugin, no. The same steps were run by hand on a cluster with two sessions per portal |
 | Several arrays per cluster, several clusters per array | yes | links, legacy migration, resolve, guard, adoption merge | single-link migration and tab, yes; a second array, no (tested with one) |
 | Morpheus wiring (storage server, tab, controller) | yes | API contract against plugin-api 1.5.0 | yes |

@@ -245,6 +245,7 @@ class RecoverySessions {
             // one cluster's failure (an array answering 503 during an upgrade) must not skip every cluster after it
             try {
                 PureClusterContext ctx = new PureClusterContext(morpheus, c.id)
+                ComplianceMonitor.setSettingsAlarm(morpheus, c, settings)
                 // first: the slower passes below must not delay the corruption guard
                 try {
                     Gfs2LockGuard.run(morpheus, ctx)

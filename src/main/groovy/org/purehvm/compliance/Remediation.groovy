@@ -7,7 +7,7 @@ import org.purehvm.ops.HostScripts
  *  - Only ADDS configuration: drop-in files (never rewrites /etc/multipath.conf, which Morpheus owns and
  *    `hvmcli storage multipath apply` replaces from a staged copy), node.startup/noop updates, new iSCSI
  *    ifaces and sessions. It never logs out a session, never restarts corosync/dlm, never runs `multipath -F`.
- *  - Never takes a host's finite no_path_retry back to 0.
+ *  - Never writes no_path_retry 0 unless the plugin's "allow lowering to 0" option is on.
  *  - Refuses the multipath change while a GFS2 filesystem is mounted through an alias (mpathX) device,
  *    because switching to WWID names would pull the device out from under it.
  *  - Follows Morpheus (HVM) where it owns iSCSI: on a host with hvmcli, sessions are made with the command Morpheus
@@ -20,25 +20,39 @@ class Remediation {
     static final String UDEV_RULES = '/etc/udev/rules.d/99-pure-storage.rules'
     static final String SYSCTL_DROPIN = '/etc/sysctl.d/99-pure-iscsi.conf'
 
-    /** The "Multipath no_path_retry" setting as a drop-in value: 0, or 1-60 retries. Anything else, queue included, is Pure's 0. */
-    static String noPathRetrySetting(Object setting) {
+    /** What an unset (or unusable) "Multipath no_path_retry" setting means: about 60 s of tolerance at polling_interval 5. */
+    static final String DEFAULT_NO_PATH_RETRY = '8'
+
+    /**
+     * The "Multipath no_path_retry" setting as a drop-in value: 1-60 retries, or 0 only when "Multipath: allow lowering
+     * to 0" is on. Unset, 0 without that option, queue and anything else are the default. An appliance whose plugin
+     * settings were never saved used to count as 0, and its hosts got `no_path_retry 0` (GFS2 withdraw on a short path
+     * loss).
+     */
+    static String noPathRetrySetting(Object setting, boolean allowZero = false) {
         String s = (setting as String)?.trim()
-        s?.isInteger() && (s as Integer) in 1..60 ? String.valueOf(s as Integer) : '0'
+        if (s?.isInteger() && (s as Integer) in 1..60) {
+            return String.valueOf(s as Integer)
+        }
+        s == '0' && allowZero ? '0' : DEFAULT_NO_PATH_RETRY
     }
 
     /**
-     * What the drop-in sets on this host: the setting, except that 0 never replaces a finite value the host already has
-     * unless lowering is explicitly allowed ("Multipath: allow lowering to 0").
+     * What the drop-in sets on this host: the setting. A 0 that is not explicitly allowed ("Multipath: allow lowering to
+     * 0") is never written: the host keeps its finite value, or gets the default.
      */
     static String dropInNoPathRetry(String setting, HostFacts f, boolean allowZero = false) {
+        if (setting != '0' || allowZero) {
+            return setting
+        }
         String host = f.noPathRetry.value
-        setting == '0' && !allowZero && ComplianceChecker.finiteRetry(host) ? host : setting
+        ComplianceChecker.finiteRetry(host) ? host : DEFAULT_NO_PATH_RETRY
     }
 
     static String multipathDropIn(boolean detectPrioNo, String noPathRetry = '0') {
         """# Managed by the Pure FlashArray for HVM Morpheus plugin - changes are overwritten.
 # Values: Everpure Linux Recommended Settings (DM-Multipath) and HPE VME FC/iSCSI guides.
-# no_path_retry: the plugin's "Multipath no_path_retry" setting, or this host's finite value.
+# no_path_retry: the plugin's "Multipath no_path_retry" setting (8 when unset). 0 only when the plugin allows it.
 devices {
     device {
         vendor                "PURE"
@@ -162,7 +176,7 @@ fi
                 boolean dp = ComplianceChecker.needsDetectPrioNo(f.packages['multipath-tools']?.version as String, purityVersion)
                 String retry = dropInNoPathRetry(noPathRetry, f, morpheus.allowZero == true)
                 writeFile(sb, MULTIPATH_DROPIN, multipathDropIn(dp, retry))
-                String note = retry != noPathRetry ? " (kept from this host; the setting asks for ${noPathRetry})" :
+                String note = retry != noPathRetry ? (retry == f.noPathRetry.value ? " (kept from this host; the setting asks for ${noPathRetry})" : ' (the default: 0 is written only when lowering to 0 is allowed)') :
                         (morpheus.allowZero == true && retry == '0' && ComplianceChecker.finiteRetry(f.noPathRetry.value) ? " (lowered from ${f.noPathRetry.value}: lowering to 0 is allowed)" : '')
                 if (f.noPathRetry.source == 'overrides') { note += " (no effect: the overrides section sets ${f.noPathRetry.value})" }
                 sb << "echo 'no_path_retry ${retry}${note}'\n"

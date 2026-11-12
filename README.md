@@ -196,7 +196,7 @@ NOP-Out 5/5 and `fast_io_fail_tmo 10`, which multipathd writes into each session
 
 | Host value | MP-03 |
 |---|---|
-| `fail` or `0` | WARN: Pure's written value, with the trade-off stated |
+| `fail` or `0` | FAIL, and Remediate writes the setting (8 when unset). WARN only when the site chose 0: setting 0 with *Multipath: allow lowering to 0* on |
 | A finite number | PASS with the computed tolerance. WARN above *Multipath tolerance warning (seconds)*, default 110, which stays inside HVM's own clocks. Pure's Multipath Concepts page lists 5-30 for brief transient failures |
 | `queue` | FAIL |
 | Unset or unreadable | FAIL |
@@ -204,9 +204,10 @@ NOP-Out 5/5 and `fast_io_fail_tmo 10`, which multipathd writes into each session
 MP-03b reads what each map is doing now: `N chk` is a healthy finite retry, `N sec` means the map has no usable path
 right now, and `off` on a finite map with no usable path means its retries ran out.
 
-**Multipath no_path_retry** (plugin setting) is what Remediate writes to the drop-in: `0` by default, or 1-60. Changing it
-alters no host until someone runs Remediate on that host. Remediate never takes a host's finite value back to 0; it
-changes a finite value only when the setting is a different finite number, and MP-03 offers it then. A number holds
+**Multipath no_path_retry** (plugin setting) is what Remediate writes to the drop-in: 1-60, `8` by default and when the
+setting is empty (plugin settings never saved). `0` is honoured only with *Multipath: allow lowering to 0* on; without
+it, 0 counts as 8 and is never written. Changing the setting alters no host until someone runs Remediate on that host.
+Remediate changes a finite value only when the setting is a different finite number, and MP-03 offers it then. A number holds
 guest I/O for the whole window, and how a long hold interacts with HVM's own clocks (all-paths-down at about 2 minutes,
 host offline at 140 s) is unknown. **Nothing has been tested against a real controller failover**, so try one on a
 test array first. The default will follow the vendors' answer.

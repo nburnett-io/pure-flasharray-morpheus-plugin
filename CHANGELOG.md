@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.15.0 (2026-11-12)
+
+**Four fixes from a health check of two installs.**
+
+- **An unset *Multipath no_path_retry* no longer means 0.** On an appliance whose plugin settings were never saved, the
+  setting counted as 0, and Remediate wrote `no_path_retry 0` to hosts that had no finite value. A short loss of all
+  paths then withdraws GFS2 and the host is reset. Now:
+  - Unset, or anything that is not 1-60, is **8** (about 60 s at `polling_interval 5`). The setting's default is 8.
+  - 0 is written only when the setting is 0 **and** *Multipath: allow lowering to 0* is on.
+  - **MP-03 fails (HIGH)** for a host at `0` or `fail`, as it already did for `queue`, and offers Remediate. With 0
+    chosen explicitly (both settings) it only warns.
+- **New: an alarm when the plugin settings were never saved.** A fresh install or a rebuilt appliance runs every
+  option on its default, which is wrong for an install with its own tag namespace or operator tenants. Each linked
+  cluster gets a warning alarm, and the cluster tab says so, until the settings are saved once.
+- **Duplicate iSCSI sessions are removed automatically (ISC-03c).** Two sessions to one portal over the same NIC
+  through different iface records (a virtual-switch iface and a hand-made one bound to the same NIC, or `default`
+  beside a bound one) double the paths without adding redundancy. The session guard (every 10 minutes, same setting as
+  for crossed sessions) and ISC-03c's Remediate now log the extra one out and delete its node record.
+  - Kept: the iface the cluster's hosts without findings use; if no host says, a bound iface over `default`, then the
+    one with more sessions.
+  - Guards: every path healthy and every LUN at 3 or more active paths before; at least 2 after, or the session logs
+    in again and the run stops.
+  - An iface record left without any session loses its remaining FlashArray node records, one by one, and is then
+    deleted itself. Otherwise a discovery that names no iface binds to it again and the duplicates return.
+  - The host's iSCSI records are saved to `/root/pure-iscsi-records-<time>.tgz` before the first change.
+- **New check UDV-00: the udev rule file.** The queue checks read live values, which stay right after the rule file is
+  deleted, until the next reboot or the next new LUN. UDV-00 warns "live values OK, rule file missing: lost at next
+  reboot" and offers the udev fix.
+
 ## 0.14.1 (2026-11-12)
 
 **iSCSI never crosses fabrics and is never routed.**

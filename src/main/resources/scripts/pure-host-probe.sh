@@ -50,6 +50,8 @@ for d in /sys/block/dm-*; do
   sch=$(sed -n 's/.*\[\(.*\)\].*/\1/p' "$d/queue/scheduler")
   echo "$n|$sch|$(cat $d/queue/add_random)|$(cat $d/queue/rq_affinity)|$(cat $d/queue/max_sectors_kb)|-"
 done
+# the plugin's udev rule file: without it the queue values above are lost at the next reboot and new LUNs never get them
+sec udevrules; if [ -s /etc/udev/rules.d/99-pure-storage.rules ]; then echo present; else echo missing; fi
 # portal|outgoing dev|gateway (empty = directly connected; a gateway means it is not a storage path for this host)
 sec routes;   for p in $PORTALS; do r=$(ip -o route get "$p" 2>/dev/null); echo "$p|$(echo "$r" | sed -n 's/.* dev \([^ ]*\).*/\1/p')|$(echo "$r" | sed -n 's/.* via \([^ ]*\).*/\1/p')"; done
 sec links;    ip -o link show 2>/dev/null | sed -E 's/^[0-9]+: ([^:@]+)[^ ]* .* mtu ([0-9]+).*/\1|\2/'
