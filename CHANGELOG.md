@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.1 (2026-11-12)
+
+**iSCSI never crosses fabrics and is never routed.**
+
+Seen in the field: a host with per-NIC iSCSI iface binding logged in to all four portals from both NICs after a
+datastore was added. A FlashArray answers ARP for every portal address on every port, so this produced crossed sessions
+(each fabric's portals reached over the other fabric's NIC) next to the real ones. Hosts built without iface binding,
+where the kernel sends each session out of the NIC on the portal's subnet, were correct but failed ISC-02.
+
+- **New: crossed and routed sessions are removed automatically (plugin setting, on by default).** Every 10 minutes,
+  each host's FlashArray sessions are checked. A session reaching its portal through a gateway, or bound to a NIC other
+  than the one on the portal's subnet, is logged out and its node record deleted, so it does not return at boot. This
+  happens only when the same portal has a correct session (for a routed session: two correct sessions exist) and every
+  LUN has at least 2 active paths. After the logout no LUN may be left without an active path; if one is, the session
+  logs in again and the run stops. Removals go to the audit log. Anything found but not removed (or everything, with the
+  setting off) is a warning alarm on the host.
+- **ISC-03b** now fails (HIGH) and also lists sessions through a gateway. Its fix, **cross-fabric**, runs the same
+  guarded removal from Remediate.
+- **ISC-02** passes for a host with no iface binding at all when each storage NIC carries its own fabric's sessions.
+  That layout cannot drift into crossed sessions. ISC-02b (sessions on "default") no longer warns in that layout.
+  A host where some storage NICs are bound and others are not still fails.
+
 ## 0.14.0 (2026-11-12)
 
 **Storage MTU per cluster: choose 1500 or 9000, check it, apply it.**

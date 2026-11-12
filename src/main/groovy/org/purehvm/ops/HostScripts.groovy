@@ -927,6 +927,65 @@ echo "PATHS=$(paths)"
     }
 
     /**
+     * Removes FlashArray iSCSI sessions that leave the host through the wrong fabric or through a gateway. iSCSI is
+     * never routed: a session counts as wrong when its portal is reached through a gateway, or when its iface is bound
+     * to a NIC other than the one on the portal's subnet (a FlashArray answers ARP for all its portal addresses on every
+     * port, so a bound iface that discovered every portal logs in to the other fabric's addresses as well).
+     * Guards, per session: a crossed one only while the same portal has a correct session, a routed one only while two
+     * correct sessions exist; and every FlashArray map must have at least 2 active paths first. After the logout no map
+     * may be left without an active path, or the session logs in again and the run stops. Only then is its node record
+     * deleted, so it does not come back at boot. With dryRun nothing changes: FOUND= lines only.
+     * Output: FOUND=<portal>|<iface>|<reason>, REMOVED=..., KEPT=<portal>|<iface>|<why>, ERROR=..., PATHS=...
+     */
+    static String removeCrossFabricSessions(boolean dryRun) {
+        HEADER + """DRY=${dryRun ? 1 : 0}
+""" + '''# maps|maps missing a path|maps with fewer than 2 active paths|maps with no active path (FlashArray maps only)
+paths() { multipathd show paths raw format "%w|%t|%T" 2>/dev/null | awk -F'|' '$1 ~ /^3624a937/ {n[$1]++; if ($2 == "active" && $3 == "ready") a[$1]++}
+  END {t=0; b=0; f=0; z=0; for (w in n) {t++; if (a[w] < n[w]) b++; if (a[w] < 2) f++; if (a[w] < 1) z++}; print t "|" b "|" f "|" z}'; }
+# target|portal ip|port|iface|netdev|state of every FlashArray session
+sessions() { iscsiadm -m session -P1 2>/dev/null | awk '
+  /^Target:/ {t=$2}
+  /Current Portal:/ {split($3, a, ","); cp=a[1]}
+  /Iface Name:/ {i=$3}
+  /Iface Netdev:/ {n=$3; if (n == "<empty>" || i == "default") n=""}
+  /iSCSI Session State:/ {if (t ~ /purestorage/) {p=cp; sub(/:[0-9]+$/, "", p); port=cp; sub(/^.*:/, "", port); print t "|" p "|" port "|" i "|" n "|" $4}; n=""}'; }
+reason() { local ip=$1 nd=$2 r dev via
+  r=$(ip -o route get "$ip" 2>/dev/null); dev=$(echo "$r" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p'); via=$(echo "$r" | sed -n 's/.* via \\([^ ]*\\).*/\\1/p')
+  if [ -n "$via" ]; then echo "routed through gateway $via"; return; fi
+  if [ -n "$nd" ] && [ -n "$dev" ] && [ "$nd" != "$dev" ]; then echo "crossed: $ip is on the subnet of $dev, session goes out $nd"; fi; }
+ALL=$(sessions)
+GOOD=""; BAD=""
+while IFS='|' read -r t ip port iface nd st; do
+  [ -n "$t" ] && [ "$st" = LOGGED_IN ] || continue
+  why=$(reason "$ip" "$nd")
+  if [ -n "$why" ]; then BAD="$BAD$t|$ip|$port|$iface|$why
+"; else GOOD="$GOOD$ip
+"; fi
+done <<< "$ALL"
+NGOOD=$(printf '%s' "$GOOD" | grep -c .)
+printf '%s' "$BAD" | while IFS='|' read -r t ip port iface why; do
+  [ -n "$t" ] || continue
+  if [ "$DRY" = 1 ]; then echo "FOUND=$ip|$iface|$why"; continue; fi
+  case "$why" in
+    crossed*) printf '%s' "$GOOD" | grep -qx "$ip" || { echo "KEPT=$ip|$iface|no correct session to $ip yet: it is this portal's only path"; continue; };;
+    *) [ "$NGOOD" -ge 2 ] || { echo "KEPT=$ip|$iface|fewer than 2 correct sessions on this host"; continue; };;
+  esac
+  S=$(paths)
+  [ "$(echo "$S" | cut -d'|' -f3)" = 0 ] || { echo "KEPT=$ip|$iface|a LUN has fewer than 2 active paths ($S)"; continue; }
+  iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" --logout >/dev/null 2>&1 || { echo "KEPT=$ip|$iface|logout failed"; continue; }
+  sleep 5
+  if [ "$(echo "$(paths)" | cut -d'|' -f4)" != 0 ]; then
+    iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" --login >/dev/null 2>&1
+    echo "ERROR=a LUN lost its last active path after logging out $ip via $iface: logged it back in; stopping"; exit 5
+  fi
+  iscsiadm -m node -T "$t" -p "$ip:$port" -I "$iface" -o delete >/dev/null 2>&1 || echo "WARN=node record $ip via $iface not deleted: it may log in again at boot"
+  echo "REMOVED=$ip|$iface|$why"
+done
+echo "PATHS=$(paths)"
+'''
+    }
+
+    /**
      * Read-only: every mounted GFS2 with its lock table, lock protocol (lock_dlm / lock_nolock) and mount point, from
      * sysfs (the kernel's own view, whatever the mount options said): GFS2=<lock table>|<protocol>|<mount point>.
      */

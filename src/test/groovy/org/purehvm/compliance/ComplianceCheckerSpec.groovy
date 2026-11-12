@@ -346,6 +346,59 @@ overrides|no_path_retry|queue
         rs.find { it.id == 'NET-06' && it.status == Status.FAIL }.hint.contains('--mtu 1500')
     }
 
+    def 'no iface binding at all, with each NIC carrying its own fabric, passes ISC-02 and drops ISC-02b'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)
+        f.ifaces = f.ifaces.findAll { !it.netdev }
+        // one unbound session per portal: the kernel routes each through the NIC on the portal's subnet
+        String target = f.pureSessions[0].target
+        f.sessions = ctx.portals.findAll { f.routes[it] }.collect { String p ->
+            [target: target, portal: p, iface: 'default', netdev: null, state: 'LOGGED_IN', viaNic: f.routes[p]]
+        }
+        List<ComplianceChecker.Result> rs = new ComplianceChecker().check(f, ctx)
+
+        expect:
+        rs.find { it.id == 'ISC-02' }.with { status == Status.PASS && observed.startsWith('none bound') && fix == null }
+        !rs.any { it.id == 'ISC-02b' }
+        !rs.any { it.id == 'ISC-03b' }
+
+        when: 'one NIC has no session at all'
+        f.sessions = f.sessions.findAll { it.viaNic == 'ens2f0.60' }
+
+        then:
+        new ComplianceChecker().check(f, ctx).find { it.id == 'ISC-02' }.status == Status.FAIL
+    }
+
+    def 'a session over the other fabric\'s NIC, or through a gateway, fails ISC-03b with the cross-fabric fix'() {
+        given:
+        HostFacts f = HostFacts.parse(getClass().getResource('/probe-sample.txt').text)
+        String target = f.pureSessions[0].target
+        String p60 = ctx.portals.find { f.routes[it] == 'ens2f0.60' }
+        String p62 = ctx.portals.find { f.routes[it] == 'ens2f1.62' }
+        f.sessions = [[target: target, portal: p60, iface: 'ens2f0.60', netdev: 'ens2f0.60', state: 'LOGGED_IN', viaNic: 'ens2f0.60'],
+                      [target: target, portal: p62, iface: 'ens2f0.60', netdev: 'ens2f0.60', state: 'LOGGED_IN', viaNic: 'ens2f0.60']]
+        List<ComplianceChecker.Result> rs = new ComplianceChecker().check(f, ctx)
+
+        expect:
+        rs.find { it.id == 'ISC-03b' }.with { status == Status.FAIL && fix == 'cross-fabric' && observed == "${p62} via ens2f0.60".toString() }
+    }
+
+    def 'the cross-fabric removal script is path-guarded and has a dry run'() {
+        when:
+        String live = HostScripts.removeCrossFabricSessions(false)
+        String dry = HostScripts.removeCrossFabricSessions(true)
+
+        then:
+        dry.contains('DRY=1') && live.contains('DRY=0')
+        live.contains('--logout') && live.contains('-o delete') && live.contains('--login')   // logs back in if a LUN lost its last path
+        live.indexOf('--logout') < live.indexOf('-o delete')                                  // the record goes only after the path check
+        live.contains('no correct session to $ip yet') && live.contains('fewer than 2 active paths')
+        live.contains('routed through gateway') && live.contains('crossed:')
+        live.contains("dev \\([^ ]*\\)")
+        live.contains('i == "default") n=""')   // an unbound session follows the routing table: never "crossed"
+        !(live =~ /multipath -F|systemctl|reboot|rm -/)
+    }
+
     def 'the probe reads hvmcli virtSwitch records'() {
         expect:
         HostFacts.parse('@@virtswitch\niSCSI-60|iscsi|9000|ens1f1.60\nvs0|general|1500|hvmup0.10,hvmup0\n@@end\n').virtswitches ==

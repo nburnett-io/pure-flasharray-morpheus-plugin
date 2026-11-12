@@ -639,8 +639,21 @@ class PureController implements PluginController {
             List<String> targets = morpheusTargets(m)
             startJob(m, 'remediate') { PureClusterContext ctx, List<String> progress ->
                 ctx.requireHost(host)
+                List<String> applied = []
+                if ('cross-fabric' in (fixes ?: [])) {
+                    // its own path-guarded script: the iSCSI/multipath remediation below never logs a session out
+                    progress << "${host}: removing iSCSI sessions that cross fabrics or go through a gateway".toString()
+                    Map x = IscsiFabricGuard.parse(ctx.runner.run(host, HostScripts.removeCrossFabricSessions(false)))
+                    (x.removed as List<String>).each { progress << "${host}: removed ${it}".toString(); Audit.warn(morpheus, null, ctx.cluster, 'removed a cross-fabric or routed iSCSI session', [host: host, session: it]) }
+                    ((x.kept + x.warnings) as List<String>).each { progress << "${host}: kept ${it}".toString() }
+                    if (x.errors) {
+                        throw new IllegalStateException("${host}: ${(x.errors as List).join('; ')}")
+                    }
+                    applied << 'cross-fabric'
+                    fixes = fixes - 'cross-fabric'
+                }
                 progress << "${host}: reading the host's current iSCSI/multipath state".toString()
-                List<String> applied = HostConnect.apply(ctx, host, fixes ?: [], targets, settings(), progress)
+                applied += fixes ? HostConnect.apply(ctx, host, fixes, targets, settings(), progress) : []
                 syncIqns(ctx, progress)   // a new initiator name must reach the Morpheus record too
                 progress << "${host}: done; run Check again to see the result".toString()
                 [host: host, applied: applied]

@@ -252,6 +252,11 @@ class RecoverySessions {
                     log.warn("GFS2 lock guard on ${c.name} failed: ${e.message}", e)
                 }
                 try {
+                    IscsiFabricGuard.run(morpheus, ctx, settings)
+                } catch (Exception e) {
+                    log.warn("iSCSI fabric guard on ${c.name} failed: ${e.message}", e)
+                }
+                try {
                     closeExpired(morpheus, ctx, c, refresh(ctx, hours).findAll { it.expires && it.expires < now })
                 } catch (Exception e) {
                     log.warn("recovery sweep of ${c.name} failed: ${e.message}", e)

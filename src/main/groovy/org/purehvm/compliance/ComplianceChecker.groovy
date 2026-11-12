@@ -109,22 +109,34 @@ class ComplianceChecker {
 
         Set<String> boundNetdevs = f.ifaces.findAll { it.netdev }*.netdev as Set<String>
         List<String> unbound = storIfs.findAll { !boundNetdevs.contains(it) }.sort()
+        List<Map> live = f.pureSessions.findAll { it.state == 'LOGGED_IN' }
+        // Unbound but routed: with no iface binding at all, the kernel sends each session out of the NIC on the portal's
+        // subnet, so every NIC carries its own fabric and nothing can cross. A FlashArray answers ARP for all its portal
+        // addresses on every port, so a BOUND iface that discovers every portal logs in to the other fabric's addresses
+        // too (ISC-03b): unbound is the layout that cannot drift into crossed sessions. It passes when no storage NIC is
+        // bound and each one carries at least one session; ISC-03 still demands a session to every portal.
+        boolean routedLayout = unbound && unbound.size() == storIfs.size() && unbound.every { String nic -> live.any { it.viaNic == nic } }
         // on HVM 2.0 Morpheus makes these ifaces with the host's iSCSI virtual switch; the plugin's sessions fix follows
         // Morpheus there (hvmcli) and does not add ifaces of its own
-        r << new Result('ISC-02', 'iSCSI iface bound to each storage NIC', Severity.HIGH, unbound ? Status.FAIL : Status.PASS,
-                unbound ? "unbound: ${unbound.join(', ')}".toString() : boundNetdevs.sort().join(', '), 'iface.net_ifacename per NIC',
-                f.hvmcli ? null : 'iscsi-sessions',
-                unbound && f.hvmcli ? 'Morpheus creates this iface with the host\'s iSCSI virtual switch: check the switch for this NIC on the host in Morpheus (edit or re-create it there).' : null)
+        r << new Result('ISC-02', 'iSCSI iface bound to each storage NIC, or none bound with sessions routed per fabric', Severity.HIGH,
+                unbound && !routedLayout ? Status.FAIL : Status.PASS,
+                routedLayout ? "none bound; sessions routed per fabric via ${unbound.join(', ')}".toString()
+                        : (unbound ? "unbound: ${unbound.join(', ')}".toString() : boundNetdevs.sort().join(', ')),
+                'iface.net_ifacename per NIC, or no binding with one fabric per NIC',
+                f.hvmcli || routedLayout ? null : 'iscsi-sessions',
+                unbound && !routedLayout && f.hvmcli ? 'Some storage NICs are bound and some are not. Morpheus creates the ifaces with the host\'s iSCSI virtual switch: check the switch for this NIC on the host in Morpheus (edit or re-create it there).' : null)
 
-        List<Map> live = f.pureSessions.findAll { it.state == 'LOGGED_IN' }
         List<String> noSession = reachable.findAll { String p -> !live.any { it.portal == p } }
         r << new Result('ISC-03', 'Logged-in session to every directly connected portal', Severity.HIGH, noSession ? Status.FAIL : Status.PASS,
                 "${live.size()} session(s)${noSession ? '; missing ' + noSession.join(', ') : ''}".toString(),
                 "${reachable.size()} (one per portal on this host's storage subnets)".toString(), 'iscsi-sessions')
         List<Map> crossFabric = live.findAll { Map s -> f.routes[s.portal] && s.viaNic && s.viaNic != f.routes[s.portal] }
-        if (crossFabric) {
-            r << new Result('ISC-03b', 'Sessions use the interface on the portal\'s own fabric', Severity.MEDIUM, Status.WARN,
-                    crossFabric.collect { "${it.portal} via ${it.viaNic}" }.join(', '), 'portal via its routed NIC', null)
+        List<Map> routed = live.findAll { Map s -> !f.routes[s.portal] && f.gatewayed[s.portal] }
+        if (crossFabric || routed) {
+            // iSCSI is never routed and never crosses fabrics: the fix logs these out (path-guarded) and deletes their records
+            r << new Result('ISC-03b', 'Sessions use the interface on the portal\'s own fabric, never a gateway', Severity.HIGH, Status.FAIL,
+                    (crossFabric.collect { "${it.portal} via ${it.viaNic}" } + routed.collect { "${it.portal} through ${f.gatewayed[it.portal]}" }).join(', '),
+                    'portal via its routed NIC, never through a gateway', 'cross-fabric')
         }
         // two sessions to one portal over the same NIC (typically "default" plus a virtual-switch iface) double the paths
         // without adding redundancy; logging one out is a maintenance-window decision, so no automatic fix
@@ -136,7 +148,8 @@ class ComplianceChecker {
                     'Extra sessions over the same NIC add paths but no redundancy. To drop one, log it out in a maintenance window (iscsiadm -m node -T <target> -p <portal> -I <iface> --logout) and set that record to manual; ISC-07 then removes it.')
         }
         List<Map> unboundSessions = live.findAll { it.iface == 'default' }
-        if (unboundSessions) {
+        // in the all-unbound layout every session is on "default" by design
+        if (unboundSessions && !routedLayout) {
             r << new Result('ISC-02b', 'Sessions bound to a named iface (not "default")', Severity.LOW, Status.WARN,
                     unboundSessions*.portal.join(', '), 'per-NIC iface (Morpheus UI targets use "default")', null)
         }

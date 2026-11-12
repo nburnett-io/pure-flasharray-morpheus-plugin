@@ -93,6 +93,11 @@ class PureFlashArrayPlugin extends Plugin {
                 new OptionType(name: 'Multipath: allow lowering to 0', code: 'pure.multipathAllowZero', fieldName: 'multipathAllowZero',
                         fieldLabel: 'Multipath: allow Remediate to lower no_path_retry to 0', inputType: OptionType.InputType.CHECKBOX, defaultValue: 'off', displayOrder: 39,
                         helpText: 'Off (default): a host with a finite no_path_retry keeps it when the setting above is 0. On: the compliance check offers Remediate to write 0 on such hosts too, for when the vendors answer that GFS2 should fail I/O at once. Changes no host until someone runs Remediate.'),
+                new OptionType(name: 'iSCSI: remove cross-fabric and routed sessions', code: 'pure.autoRemoveCrossFabric', fieldName: 'autoRemoveCrossFabric',
+                        fieldLabel: 'iSCSI: remove cross-fabric and routed sessions automatically', inputType: OptionType.InputType.CHECKBOX, defaultValue: 'on', displayOrder: 39,
+                        helpText: 'On (default): every 10 minutes, a FlashArray iSCSI session that reaches its portal through a gateway, or through the other fabric\'s NIC (VLAN A portal over the VLAN B NIC), is logged out and its record deleted. ' +
+                                'Only while the same portal has a correct session (or, for a routed one, two correct sessions exist), every LUN has at least 2 active paths, and no LUN is left without a path afterwards. ' +
+                                'Off: such sessions only raise a warning alarm on the host, and Remediate removes them.'),
                 new OptionType(name: 'Multipath tolerance warning (seconds)', code: 'pure.multipathToleranceWarnSeconds', fieldName: 'multipathToleranceWarnSeconds',
                         fieldLabel: 'Multipath tolerance warning (seconds)', inputType: OptionType.InputType.TEXT, defaultValue: String.valueOf(ComplianceChecker.DEFAULT_TOLERANCE_WARN_SECONDS), displayOrder: 39,
                         helpText: 'The compliance check warns when a host\'s finite no_path_retry would hold I/O longer than this (about 20 s + N x polling_interval). The default stays inside HVM\'s own storage-loss clocks (all-paths-down at about 2 minutes, host offline at 140 s).'),
