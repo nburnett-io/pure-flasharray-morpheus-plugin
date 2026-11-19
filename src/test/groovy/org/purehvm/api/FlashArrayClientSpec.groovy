@@ -80,6 +80,61 @@ class FlashArrayClientSpec extends Specification {
         fake.calls.find { it.uri.contains('/arrays') }.headers['x-auth-token'] == 'session-1'
     }
 
+    // FlashArray integrations identify themselves as pure/<client name>/<client version>[;<optional text>].
+    def 'every request to the array carries the pure/<client>/<version> User-Agent'() {
+        given:
+        fake.on('GET', '/api/2.51/arrays') { u, h, b -> ok([items: [[id: 'abc', name: 'fa1', version: '6.10.4']]]) }
+
+        when:
+        client.array
+        client.close()
+
+        then: 'api_version, login, a call and logout all send it'
+        fake.calls.size() >= 4
+        fake.calls.every { it.headers['User-Agent'] == FlashArrayClient.USER_AGENT }
+
+        and: 'the build filled in the version'
+        FlashArrayClient.USER_AGENT ==~ /pure\/MorpheusHvmPlugin\/\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?/
+    }
+
+    def 'the credential exchange sends it too'() {
+        given:
+        def fake = credentialArray()
+        fake.on('POST', '/api/2.48/login') { u, h, b -> ok([items: []], ['x-auth-token': 'pw-session']) }
+        fake.on('POST', '/api/2.48/admins/api-tokens') { u, h, b -> ok([items: [[name: 'svc', api_token: [token: FAKE_TOKEN]]]]) }
+        fake.on('POST', '/api/2.48/logout') { u, h, b -> ok([:]) }
+
+        when:
+        FlashArrayClient.exchangeCredentialsForApiToken('array.example.invalid', 'svc', 'not-a-real-password', fake)
+
+        then:
+        fake.calls.size() >= 4
+        fake.calls.every { it.headers['User-Agent'] == FlashArrayClient.USER_AGENT }
+    }
+
+    def 'the User-Agent keeps the name, which ends with a slash, when the version is unknown'() {
+        expect:
+        FlashArrayClient.userAgent('MorpheusHvmPlugin', '1.2.3') == 'pure/MorpheusHvmPlugin/1.2.3'
+        FlashArrayClient.userAgent('MorpheusHvmPlugin', '') == 'pure/MorpheusHvmPlugin/'
+        FlashArrayClient.userAgent('MorpheusHvmPlugin', null) == 'pure/MorpheusHvmPlugin/'
+    }
+
+    def 'only a version that is safe in a header is used'() {
+        expect:
+        FlashArrayClient.cleanVersion(version) == expected
+
+        where:
+        version              | expected
+        '0.16.0'             | '0.16.0'
+        ' 0.16.0\n'          | '0.16.0'
+        '1.0.0-rc.1'         | '1.0.0-rc.1'
+        '@PLUGIN_VERSION@'   | ''    // the build did not fill it in
+        ''                   | ''
+        null                 | ''
+        "1.0\r\nX-Evil: 1"   | ''
+        '1.0 beta'           | ''
+    }
+
     def 'follows continuation tokens'() {
         given:
         fake.on('GET', 'continuation_token=p2') { u, h, b -> ok([items: [[name: 'v3']], more_items_remaining: false]) }
