@@ -62,6 +62,10 @@ processResources {
     filesMatching('renderer/**/*.hbs') {
         filter { String line -> line.replace('@PLUGIN_VERSION@', project.version.toString()) }
     }
+    // The User-Agent of requests to the array carries the plugin version (FlashArrayClient.pluginVersion).
+    filesMatching('org/purehvm/api/version.properties') {
+        filter { String line -> line.replace('@PLUGIN_VERSION@', project.version.toString()) }
+    }
 }
 
 test {

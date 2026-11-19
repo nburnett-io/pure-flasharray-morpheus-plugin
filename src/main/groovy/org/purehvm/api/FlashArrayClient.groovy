@@ -23,7 +23,31 @@ class FlashArrayClient implements Closeable {
     static final String MIN_API = '2.3'
     static final String MAX_API = '2.51'
     static final int PAGE_SIZE = 1000
-    static final String USER_AGENT = 'morpheus-pure-hvm-plugin'
+    /** The client name in the User-Agent: FlashArray integrations send pure/<client name>/<client version>. */
+    static final String CLIENT_NAME = 'MorpheusHvmPlugin'
+    static final String USER_AGENT = userAgent(CLIENT_NAME, pluginVersion())
+
+    /** The name ends with a slash even when the version is unknown, so the value stays parseable. */
+    static String userAgent(String name, String version) {
+        'pure/' + name + '/' + (version ?: '')
+    }
+
+    /** The plugin version the build wrote into version.properties (see processResources); '' if it cannot be read. */
+    static String pluginVersion() {
+        Properties p = new Properties()
+        try {
+            FlashArrayClient.class.getResourceAsStream('version.properties')?.withCloseable { p.load(it) }
+        } catch (IOException ignored) {
+            // no version is better than no connection to the array
+        }
+        cleanVersion(p.getProperty('version'))
+    }
+
+    /** The value goes into an HTTP header: keep it to what a release version is made of ('' for an unfilled placeholder). */
+    static String cleanVersion(String raw) {
+        String v = raw?.trim()
+        v ==~ /[0-9A-Za-z.+~-]+/ ? v : ''
+    }
 
     final String baseUrl
     private final String apiToken
